@@ -30,27 +30,57 @@ const CONFIG = {
 // ─── Domains to auto-remove ──────────────────────────────────────────────────────
 const BLOCKED_TLDS = ['.org', '.org.uk'];
 
-// ─── Non-ecommerce category keywords ────────────────────────────────────────────
+// ─── Non-ecommerce category keywords (matched against StoreLeads categories) ────
+// These are broad keywords that match StoreLeads paths like "/Internet/Voice & Video Chat"
 const NON_ECOMMERCE_CATEGORIES = [
+    // Telecom / VoIP
     'voice & video chat', 'voip', 'telecom', 'telecommunications',
-    'social issues', 'advocacy', 'nonprofit', 'charity',
-    'film', 'films', 'cinema', 'movie', 'movies',
-    'arts & entertainment',
-    'recruitment', 'staffing', 'jobs', 'employment',
-    'education', 'training & certification', 'courses',
+    // Nonprofits / Charities / Advocacy
+    'social issues', 'advocacy', 'nonprofit', 'charity', 'foundation',
+    // Government / Public
+    'government', 'municipality', 'public agency', 'military',
+    // Professional Services (no products sold online)
+    'law', 'legal services', 'accounting', 'financial advisory',
+    'insurance', 'architecture', 'engineering firm',
     'consulting', 'business operations',
-    'real estate', 'construction', 'scaffolding',
-    'internet', 'web hosting', 'saas',
+    // Local Services (no online checkout)
+    'restaurant', 'cafe', 'bar', 'barbershop', 'salon', 'spa',
+    'plumbing', 'electrician', 'landscaping', 'construction', 'scaffolding',
+    // Healthcare (informational)
+    'hospital', 'clinic', 'dental', 'therapy', 'mental health',
+    // Real Estate
+    'real estate',
+    // Media / Entertainment (no store)
+    'streaming', 'radio station', 'tv channel',
+    'photography portfolio', 'art portfolio',
+    // Directories / Aggregators
+    'business directory', 'job board', 'classified ads', 'review site', 'coupon site',
+    // Recruitment / Staffing
+    'recruitment', 'staffing', 'employment',
+    // Internet / Hosting
+    'web hosting', 'saas',
+    // Events only
+    'conference', 'meetup', 'wedding',
 ];
 
 // ─── Non-ecommerce description keywords ─────────────────────────────────────────
+// Strong signals in the site description that it's NOT selling products
 const NON_ECOMMERCE_DESCRIPTION_KEYWORDS = [
-    'voip', 'telephone system', 'phone system', 'cloud hosted', 'voip telephone',
-    'recruitment solution', 'free online training', 'online courses', 'recruitment solutions',
+    // Telecom / VoIP
+    'voip', 'telephone system', 'phone system', 'voip telephone',
+    // Recruitment
+    'recruitment solution', 'recruitment solutions', 'we provide recruitment',
+    // Film / Media
     'impact strategy', 'film community', 'documentary', 'sundance', 'international film',
+    // Construction / Engineering
     'scaffolding', 'engineering & design', 'access scaffolding',
-    'we provide recruitment', 'screening',
+    // Nonprofit / Charity
     'charity', 'donate', 'donation',
+    // Professional services
+    'law firm', 'legal advice', 'financial advisory',
+    // Dev / Test / Demo
+    'demo site', 'test site', 'staging site', 'under construction', 'coming soon',
+    'plugin demo', 'theme demo', 'woocommerce demo',
 ];
 
 // ─── Lorem ipsum / dummy content patterns ────────────────────────────────────────
