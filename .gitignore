@@ -1,4 +1,5 @@
 node_modules/
+results_*/
 *_verified.csv
 verify_log.txt
 output.csv

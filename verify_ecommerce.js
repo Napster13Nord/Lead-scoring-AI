@@ -506,21 +506,76 @@ async function verifySite(row) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────────
 
-async function main() {
-    const args = process.argv.slice(2);
+/**
+ * Prompt user for input in the terminal.
+ */
+function askQuestion(question) {
+    return new Promise((resolve) => {
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer.trim());
+        });
+    });
+}
 
-    if (args.length === 0) {
-        console.log('Usage: node verify_ecommerce.js <input.csv> [output.csv]');
+/**
+ * Wait for Enter key before closing the window.
+ */
+function waitForEnter(message = '\nPressione ENTER para fechar...') {
+    return new Promise((resolve) => {
+        const readline = require('readline');
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        rl.question(message, () => {
+            rl.close();
+            resolve();
+        });
+    });
+}
+
+async function main() {
+    console.log('╔══════════════════════════════════════════════════════════╗');
+    console.log('║    WooCommerce E-commerce Verifier                      ║');
+    console.log('║    Verifica se sites WooCommerce vendem de verdade       ║');
+    console.log('╚══════════════════════════════════════════════════════════╝\n');
+
+    let inputFile = process.argv[2];
+
+    // If no file provided, ask the user
+    if (!inputFile) {
+        // List CSV files in the current directory
+        const csvFiles = fs.readdirSync('.').filter(f => f.endsWith('.csv'));
+        if (csvFiles.length > 0) {
+            console.log('📋 Ficheiros CSV encontrados nesta pasta:\n');
+            csvFiles.forEach((f, i) => console.log(`   ${i + 1}. ${f}`));
+            console.log('');
+            const answer = await askQuestion('Digite o número ou o nome do ficheiro CSV: ');
+
+            // Check if answer is a number (index)
+            const idx = parseInt(answer, 10);
+            if (idx >= 1 && idx <= csvFiles.length) {
+                inputFile = csvFiles[idx - 1];
+            } else {
+                inputFile = answer;
+            }
+        } else {
+            inputFile = await askQuestion('Digite o nome do ficheiro CSV: ');
+        }
+    }
+
+    // Validate input file
+    if (!inputFile || !fs.existsSync(inputFile)) {
+        console.error(`\n❌ Ficheiro não encontrado: "${inputFile}"`);
+        console.error('   Coloque o ficheiro CSV na mesma pasta que este script.');
+        await waitForEnter();
         process.exit(1);
     }
 
-    const inputFile = args[0];
-    const outputFile = args[1] || inputFile.replace('.csv', '_verified.csv');
-
-    console.log(`📂 Reading: ${inputFile}`);
+    console.log(`\n📂 A ler: ${inputFile}`);
     const csvText = fs.readFileSync(inputFile, 'utf-8');
     const rows = parseCSV(csvText);
-    console.log(`📋 Found ${rows.length} leads to verify\n`);
+    console.log(`📋 ${rows.length} leads encontrados para verificar\n`);
 
     // Get headers from original file
     const firstLine = csvText.split(/\r?\n/)[0];
@@ -537,6 +592,7 @@ async function main() {
 
     for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
+        console.log(`\n⏳ [${i + 1}/${rows.length}] A verificar ${row.domain || row.domain_url}...`);
 
         const verification = await verifySite(row);
 
@@ -553,36 +609,60 @@ async function main() {
         }
     }
 
-    // Write output CSV
-    const outputLines = [headers.join(',')];
-    for (const row of results) {
-        outputLines.push(rowToCSV(row, headers));
+    // ─── Create results folder ──────────────────────────────────────────────────
+    const baseName = path.basename(inputFile, '.csv');
+    const resultsDir = path.join(path.dirname(inputFile) || '.', `results_${baseName}`);
+
+    if (!fs.existsSync(resultsDir)) {
+        fs.mkdirSync(resultsDir, { recursive: true });
     }
-
-    fs.writeFileSync(outputFile, outputLines.join('\n'), 'utf-8');
-
-    // Print summary
-    console.log(`\n\n${'═'.repeat(60)}`);
-    console.log(`📊 FINAL SUMMARY`);
-    console.log(`${'═'.repeat(60)}`);
 
     const kept = results.filter(r => r.woo_verified === 'YES');
     const removed = results.filter(r => r.woo_verified === 'NO');
 
-    console.log(`\n✅ KEEP (${kept.length}):`);
+    // Write KEEP CSV
+    const keepFile = path.join(resultsDir, `KEEP_${baseName}.csv`);
+    const keepLines = [headers.join(',')];
+    for (const row of kept) {
+        keepLines.push(rowToCSV(row, headers));
+    }
+    fs.writeFileSync(keepFile, keepLines.join('\n'), 'utf-8');
+
+    // Write REMOVE CSV
+    const removeFile = path.join(resultsDir, `REMOVE_${baseName}.csv`);
+    const removeLines = [headers.join(',')];
+    for (const row of removed) {
+        removeLines.push(rowToCSV(row, headers));
+    }
+    fs.writeFileSync(removeFile, removeLines.join('\n'), 'utf-8');
+
+    // ─── Print summary ──────────────────────────────────────────────────────────
+    console.log(`\n\n${'═'.repeat(60)}`);
+    console.log(`📊 RESUMO FINAL`);
+    console.log(`${'═'.repeat(60)}`);
+
+    console.log(`\n✅ MANTER (${kept.length}):`);
     for (const r of kept) {
         console.log(`   • ${r.domain} (score: ${r.verification_score})`);
     }
 
-    console.log(`\n❌ REMOVE (${removed.length}):`);
+    console.log(`\n❌ REMOVER (${removed.length}):`);
     for (const r of removed) {
         console.log(`   • ${r.domain} (score: ${r.verification_score})`);
     }
 
-    console.log(`\n💾 Results saved to: ${outputFile}`);
+    console.log(`\n${'─'.repeat(60)}`);
+    console.log(`📁 Resultados salvos em: ${resultsDir}/`);
+    console.log(`   ✅ ${keepFile}`);
+    console.log(`   ❌ ${removeFile}`);
+
+    await waitForEnter();
 }
 
-main().catch(err => {
-    console.error('Fatal error:', err);
+main().catch(async (err) => {
+    console.error('\n❌ Erro fatal:', err.message || err);
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    await new Promise(r => rl.question('\nPressione ENTER para fechar...', () => { rl.close(); r(); }));
     process.exit(1);
 });
