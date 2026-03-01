@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 /**
- * WooCommerce E-commerce Verifier
+ * WooCommerce E-commerce Verifier (v2 — Optimized for large lists)
  * 
- * Reads a CSV of StoreLeads data and verifies which sites are REAL e-commerce stores
- * vs. sites that merely have WooCommerce installed but aren't actively selling products.
+ * Reads a CSV of StoreLeads data and verifies which sites are REAL e-commerce stores.
+ * Optimized for 80k+ contacts with:
+ *  - Instant pre-filtering (removes .org, obvious non-ecommerce from CSV data alone)
+ *  - Concurrent HTTP verification (10 sites at a time)
+ *  - Resume capability (saves progress every batch)
+ *  - Two output CSVs: KEEP and REMOVE
  * 
- * Usage: node verify_ecommerce.js <input.csv> [output.csv]
+ * Usage: node verify_ecommerce.js <input.csv>
+ *    or: double-click VERIFICAR.bat
  */
 
 const fs = require('fs');
@@ -13,13 +18,17 @@ const path = require('path');
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 const CONFIG = {
-    requestTimeout: 10000,
+    requestTimeout: 8000,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    // Score thresholds
-    passThreshold: 45,       // Score >= this = KEEP
-    // Delay between requests per domain (ms)
-    delayBetweenSites: 1500,
+    passThreshold: 45,
+    // Concurrency: how many sites to check at the same time
+    concurrency: 10,
+    // Save progress every N sites
+    saveEvery: 50,
 };
+
+// ─── Domains to auto-remove ──────────────────────────────────────────────────────
+const BLOCKED_TLDS = ['.org', '.org.uk'];
 
 // ─── Non-ecommerce category keywords ────────────────────────────────────────────
 const NON_ECOMMERCE_CATEGORIES = [
@@ -58,14 +67,28 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Parse CSV text into an array of row objects.
- * Uses simple line splitting (safe for CSVs without newlines inside quoted fields).
- */
+function splitCSVLine(line) {
+    const fields = [];
+    let current = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+            if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+            else { inQuotes = !inQuotes; }
+        } else if (ch === ',' && !inQuotes) {
+            fields.push(current); current = '';
+        } else {
+            current += ch;
+        }
+    }
+    fields.push(current);
+    return fields;
+}
+
 function parseCSV(text) {
     const lines = text.split(/\r?\n/).filter(l => l.trim());
-    if (lines.length === 0) return [];
-
+    if (lines.length === 0) return { headers: [], rows: [] };
     const headers = splitCSVLine(lines[0]);
     const rows = [];
     for (let i = 1; i < lines.length; i++) {
@@ -76,32 +99,7 @@ function parseCSV(text) {
         }
         rows.push(row);
     }
-    return rows;
-}
-
-function splitCSVLine(line) {
-    const fields = [];
-    let current = '';
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (ch === '"') {
-            if (inQuotes && line[i + 1] === '"') {
-                current += '"';
-                i++;
-            } else {
-                inQuotes = !inQuotes;
-            }
-        } else if (ch === ',' && !inQuotes) {
-            fields.push(current);
-            current = '';
-        } else {
-            current += ch;
-        }
-    }
-    fields.push(current);
-    return fields;
+    return { headers, rows };
 }
 
 function escapeCSVField(value) {
@@ -116,21 +114,14 @@ function rowToCSV(row, headers) {
     return headers.map(h => escapeCSVField(row[h])).join(',');
 }
 
-/**
- * Fetch with timeout and error handling.
- */
 async function safeFetch(url, options = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeout);
-
     try {
         const res = await fetch(url, {
             ...options,
             signal: controller.signal,
-            headers: {
-                'User-Agent': CONFIG.userAgent,
-                ...(options.headers || {}),
-            },
+            headers: { 'User-Agent': CONFIG.userAgent, ...(options.headers || {}) },
         });
         clearTimeout(timeout);
         return res;
@@ -140,521 +131,436 @@ async function safeFetch(url, options = {}) {
     }
 }
 
-// ─── Verification Checks ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 1: CSV-only pre-filtering (instant, no HTTP requests)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Check 1: WooCommerce Store API — fetch products and analyze content quality.
- */
-async function checkWCStoreAPI(domainUrl) {
-    const baseUrl = domainUrl.replace(/\/+$/, '');
-    const apiUrl = `${baseUrl}/wp-json/wc/store/products?per_page=10`;
+function preFilterRow(row) {
+    const domain = (row.domain || row.domain_url || '').toLowerCase();
 
-    const result = {
-        apiAccessible: false,
-        productCount: 0,
-        productsWithPrice: 0,
-        hasAddToCart: false,
-        hasDummyContent: false,
-        dummyContentDetails: [],
-        productNames: [],
-        score: 0,
-    };
-
-    const res = await safeFetch(apiUrl);
-    if (!res || res.status !== 200) {
-        return result;
-    }
-
-    let products;
-    try {
-        products = await res.json();
-        if (!Array.isArray(products)) return result;
-    } catch {
-        return result;
-    }
-
-    result.apiAccessible = true;
-    result.productCount = products.length;
-
-    // Analyze each product
-    for (const p of products) {
-        const name = (p.name || '').toLowerCase();
-        const shortDesc = (p.short_description || '').toLowerCase();
-        const desc = (p.description || '').toLowerCase();
-        const allText = `${name} ${shortDesc} ${desc}`;
-
-        result.productNames.push(p.name || 'unnamed');
-
-        // Check prices
-        const price = parseFloat(p.prices?.price || 0);
-        const regularPrice = parseFloat(p.prices?.regular_price || 0);
-        if (price > 0 || regularPrice > 0) {
-            result.productsWithPrice++;
-        }
-
-        // Check add to cart
-        const cartText = (p.add_to_cart?.text || '').toLowerCase();
-        if (cartText.includes('add to cart') || cartText.includes('add to basket')) {
-            result.hasAddToCart = true;
-        }
-
-        // Check for dummy/lorem ipsum content
-        for (const pattern of DUMMY_CONTENT_PATTERNS) {
-            if (allText.includes(pattern)) {
-                result.hasDummyContent = true;
-                result.dummyContentDetails.push(`"${p.name}": contains "${pattern}"`);
-                break;
-            }
+    // 1) Block .org TLDs
+    for (const tld of BLOCKED_TLDS) {
+        if (domain.endsWith(tld) || domain.includes(tld + '/')) {
+            return { pass: false, reason: `Dominio ${tld} — auto-removido` };
         }
     }
 
-    // Scoring
-    if (result.hasDummyContent) {
-        result.score = -50; // Strong negative signal
-    } else if (result.productsWithPrice > 0 && result.hasAddToCart) {
-        result.score = 30;
-    } else if (result.productsWithPrice > 0) {
-        result.score = 20;
-    } else if (result.productCount > 0) {
-        result.score = 5;
-    }
-
-    return result;
-}
-
-/**
- * Check 2: Category & Description analysis from CSV data.
- * Determines if the business type is fundamentally non-ecommerce.
- */
-function checkCategoryAndDescription(row, wcApiResult) {
-    const result = {
-        isNonEcommCategory: false,
-        isNonEcommDescription: false,
-        matchedCategory: '',
-        matchedDescKeyword: '',
-        score: 0,
-    };
-
+    // 2) Check category + description combo (strongest signal)
     const categories = (row.categories || '').toLowerCase();
     const description = (row.description || row.meta_description || '').toLowerCase();
     const title = (row.title || '').toLowerCase();
     const allText = `${categories} ${description} ${title}`;
 
-    // Check categories
-    for (const keyword of NON_ECOMMERCE_CATEGORIES) {
-        if (categories.includes(keyword)) {
-            result.isNonEcommCategory = true;
-            result.matchedCategory = keyword;
-            break;
+    let hasNonEcommCategory = false;
+    let matchedCat = '';
+    for (const kw of NON_ECOMMERCE_CATEGORIES) {
+        if (categories.includes(kw)) { hasNonEcommCategory = true; matchedCat = kw; break; }
+    }
+
+    let hasNonEcommDesc = false;
+    let matchedDesc = '';
+    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) {
+        if (allText.includes(kw)) { hasNonEcommDesc = true; matchedDesc = kw; break; }
+    }
+
+    // If BOTH category and description match non-ecommerce → instant remove
+    const productsSold = parseInt(row.products_sold || '0', 10);
+    if (hasNonEcommCategory && hasNonEcommDesc && productsSold < 50) {
+        return { pass: false, reason: `Categoria "${matchedCat}" + descrição "${matchedDesc}" = não é ecommerce` };
+    }
+
+    // 3) Sites with 0 products and very low estimated sales
+    const salesStr = (row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '');
+    const sales = parseFloat(salesStr) || 0;
+    if (productsSold === 0 && sales < 500) {
+        return { pass: false, reason: `0 produtos e vendas < $500/mês` };
+    }
+
+    return { pass: true, reason: '' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 2: HTTP-based verification checks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function checkWCStoreAPI(domainUrl) {
+    const baseUrl = domainUrl.replace(/\/+$/, '');
+    const result = {
+        apiAccessible: false, productCount: 0, productsWithPrice: 0,
+        hasAddToCart: false, hasDummyContent: false, dummyContentDetails: [], score: 0
+    };
+
+    const res = await safeFetch(`${baseUrl}/wp-json/wc/store/products?per_page=10`);
+    if (!res || res.status !== 200) return result;
+
+    let products;
+    try { products = await res.json(); if (!Array.isArray(products)) return result; }
+    catch { return result; }
+
+    result.apiAccessible = true;
+    result.productCount = products.length;
+
+    for (const p of products) {
+        const allText = `${p.name || ''} ${p.short_description || ''} ${p.description || ''}`.toLowerCase();
+        const price = parseFloat(p.prices?.price || 0);
+        const regular = parseFloat(p.prices?.regular_price || 0);
+        if (price > 0 || regular > 0) result.productsWithPrice++;
+        const cartText = (p.add_to_cart?.text || '').toLowerCase();
+        if (cartText.includes('add to cart') || cartText.includes('add to basket')) result.hasAddToCart = true;
+        for (const pat of DUMMY_CONTENT_PATTERNS) {
+            if (allText.includes(pat)) { result.hasDummyContent = true; result.dummyContentDetails.push(pat); break; }
         }
     }
 
-    // Check description
-    for (const keyword of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) {
-        if (allText.includes(keyword)) {
-            result.isNonEcommDescription = true;
-            result.matchedDescKeyword = keyword;
-            break;
-        }
-    }
+    if (result.hasDummyContent) result.score = -50;
+    else if (result.productsWithPrice > 0 && result.hasAddToCart) result.score = 30;
+    else if (result.productsWithPrice > 0) result.score = 20;
+    else if (result.productCount > 0) result.score = 5;
 
-    // If we have evidence of real products (from WC API or StoreLeads product count),
-    // reduce category-only penalty — many legitimate stores have non-ecommerce categories
+    return result;
+}
+
+function checkCategoryAndDescription(row, wcApiResult) {
+    const categories = (row.categories || '').toLowerCase();
+    const description = (row.description || row.meta_description || '').toLowerCase();
+    const title = (row.title || '').toLowerCase();
+    const allText = `${categories} ${description} ${title}`;
+
+    let isNonEcommCategory = false, isNonEcommDescription = false;
+    for (const kw of NON_ECOMMERCE_CATEGORIES) { if (categories.includes(kw)) { isNonEcommCategory = true; break; } }
+    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) { if (allText.includes(kw)) { isNonEcommDescription = true; break; } }
+
     const csvProductCount = parseInt(row.products_sold || '0', 10);
     const hasRealProducts = (wcApiResult && wcApiResult.productsWithPrice > 0 && !wcApiResult.hasDummyContent)
         || csvProductCount >= 100;
 
-    // Scoring
-    if (result.isNonEcommCategory && result.isNonEcommDescription) {
-        result.score = -50; // Very strong non-ecommerce signal
-    } else if (result.isNonEcommDescription) {
-        result.score = -30; // Description is a stronger signal than category alone
-    } else if (result.isNonEcommCategory) {
-        // Category alone is weaker — many real stores have non-ecommerce categories
-        result.score = hasRealProducts ? -5 : -20;
-    } else {
-        result.score = 10; // Category seems e-commerce compatible
-    }
-
-    return result;
+    if (isNonEcommCategory && isNonEcommDescription) return -50;
+    if (isNonEcommDescription) return -30;
+    if (isNonEcommCategory) return hasRealProducts ? -5 : -20;
+    return 10;
 }
 
-/**
- * Check 3: Analyze product count from StoreLeads data.
- */
 function checkProductCount(row) {
-    const productsSold = parseInt(row.products_sold || '0', 10);
-
-    const result = {
-        productsSold,
-        score: 0,
-    };
-
-    if (productsSold >= 100) {
-        result.score = 25; // Strong signal of real store
-    } else if (productsSold >= 20) {
-        result.score = 15;
-    } else if (productsSold >= 5) {
-        result.score = 5;
-    } else if (productsSold > 0) {
-        result.score = -5; // Very few products, suspicious
-    } else {
-        result.score = -15; // No products at all
-    }
-
-    return result;
+    const p = parseInt(row.products_sold || '0', 10);
+    if (p >= 100) return 25;
+    if (p >= 20) return 15;
+    if (p >= 5) return 5;
+    if (p > 0) return -5;
+    return -15;
 }
 
-/**
- * Check 4: Homepage scrape — look for e-commerce signals in the HTML.
- */
-async function checkHomepage(domainUrl) {
-    const result = {
-        accessible: false,
-        hasShopLink: false,
-        hasProductPrices: false,
-        hasCartLink: false,
-        hasWooProductMarkup: false,
-        score: 0,
-    };
-
-    const res = await safeFetch(domainUrl);
-    if (!res || res.status !== 200) {
-        return result;
-    }
-
-    let html;
-    try {
-        html = await res.text();
-    } catch {
-        return result;
-    }
-
-    result.accessible = true;
-    const lower = html.toLowerCase();
-
-    // Check for shop/store links
-    result.hasShopLink = lower.includes('/shop') || lower.includes('/store') ||
-        lower.includes('/products') || lower.includes('href="/shop"') ||
-        lower.includes("href='/shop'");
-
-    // Check for product prices on homepage
-    result.hasProductPrices = lower.includes('woocommerce-price-amount') ||
-        lower.includes('price-amount');
-
-    // Check for cart link
-    result.hasCartLink = lower.includes('/cart') || lower.includes('/basket') ||
-        lower.includes('cart-contents');
-
-    // Check for WooCommerce product markup
-    result.hasWooProductMarkup = lower.includes('add_to_cart_button') ||
-        lower.includes('woocommerce-loop') ||
-        lower.includes('products columns') ||
-        lower.includes('product-category');
-
-    // Scoring
-    let signalCount = [result.hasShopLink, result.hasProductPrices, result.hasCartLink, result.hasWooProductMarkup]
-        .filter(Boolean).length;
-
-    if (signalCount >= 3) {
-        result.score = 25;
-    } else if (signalCount >= 2) {
-        result.score = 15;
-    } else if (signalCount >= 1) {
-        result.score = 5;
-    } else {
-        result.score = -10;
-    }
-
-    return result;
-}
-
-/**
- * Check 5: Cart page — verify it has real WooCommerce e-commerce content.
- */
-async function checkCartPage(domainUrl) {
-    const baseUrl = domainUrl.replace(/\/+$/, '');
-    const cartUrl = `${baseUrl}/cart`;
-
-    const result = {
-        accessible: false,
-        hasWooCartMarkup: false,
-        score: 0,
-    };
-
-    const res = await safeFetch(cartUrl);
-    if (!res || res.status !== 200) {
-        return result;
-    }
-
-    let html;
-    try {
-        html = await res.text();
-    } catch {
-        return result;
-    }
-
-    result.accessible = true;
-    const lower = html.toLowerCase();
-
-    result.hasWooCartMarkup = lower.includes('woocommerce-cart') ||
-        lower.includes('woocommerce-checkout') ||
-        lower.includes('wc-cart') ||
-        lower.includes('woocommerce_cart_nonce') ||
-        lower.includes('cart-empty');
-
-    result.score = result.hasWooCartMarkup ? 10 : -5;
-    return result;
-}
-
-/**
- * Check 6: Estimated monthly sales — use StoreLeads data.
- */
 function checkMonthlySales(row) {
-    // Parse the sales value (format: "USD $5,129.03")
-    const salesStr = (row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '');
-    const sales = parseFloat(salesStr) || 0;
+    const sales = parseFloat((row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '')) || 0;
+    if (sales >= 10000) return 20;
+    if (sales >= 1000) return 10;
+    if (sales >= 500) return 0;
+    return -10;
+}
 
-    const result = {
-        monthlySales: sales,
-        score: 0,
-    };
-
-    if (sales >= 10000) {
-        result.score = 20; // Solid sales volume
-    } else if (sales >= 1000) {
-        result.score = 10;
-    } else if (sales >= 500) {
-        result.score = 0;  // Borderline
-    } else {
-        result.score = -10; // Very low or no sales
-    }
-
+async function checkHomepage(domainUrl) {
+    const result = { score: 0 };
+    const res = await safeFetch(domainUrl);
+    if (!res || res.status !== 200) { result.score = -10; return result; }
+    let html;
+    try { html = await res.text(); } catch { result.score = -10; return result; }
+    const lower = html.toLowerCase();
+    const signals = [
+        lower.includes('/shop') || lower.includes('/store') || lower.includes('/products'),
+        lower.includes('woocommerce-price-amount') || lower.includes('price-amount'),
+        lower.includes('/cart') || lower.includes('/basket') || lower.includes('cart-contents'),
+        lower.includes('add_to_cart_button') || lower.includes('woocommerce-loop') || lower.includes('product-category'),
+    ].filter(Boolean).length;
+    if (signals >= 3) result.score = 25;
+    else if (signals >= 2) result.score = 15;
+    else if (signals >= 1) result.score = 5;
+    else result.score = -10;
     return result;
 }
 
-// ─── Main Verification Pipeline ──────────────────────────────────────────────────
+async function checkCartPage(domainUrl) {
+    const res = await safeFetch(`${domainUrl.replace(/\/+$/, '')}/cart`);
+    if (!res || res.status !== 200) return 0;
+    let html;
+    try { html = await res.text(); } catch { return -5; }
+    const lower = html.toLowerCase();
+    const hasWoo = lower.includes('woocommerce-cart') || lower.includes('woocommerce-checkout')
+        || lower.includes('wc-cart') || lower.includes('woocommerce_cart_nonce') || lower.includes('cart-empty');
+    return hasWoo ? 10 : -5;
+}
 
+/** Full HTTP verification for one site. Returns { totalScore, passed, verdict } */
 async function verifySite(row) {
-    const domain = row.domain || '';
     const domainUrl = row.domain_url || '';
 
-    console.log(`\n${'═'.repeat(60)}`);
-    console.log(`🔍 Verifying: ${domain} (${domainUrl})`);
-    console.log(`${'═'.repeat(60)}`);
-
-    // Run all checks
-    const [wcApi, homepage, cartPage] = await Promise.all([
+    const [wcApi, homepage, cartScore] = await Promise.all([
         checkWCStoreAPI(domainUrl),
         checkHomepage(domainUrl),
         checkCartPage(domainUrl),
     ]);
 
-    const categoryCheck = checkCategoryAndDescription(row, wcApi);
-    const productCountCheck = checkProductCount(row);
-    const salesCheck = checkMonthlySales(row);
+    const catScore = checkCategoryAndDescription(row, wcApi);
+    const prodScore = checkProductCount(row);
+    const salesScore = checkMonthlySales(row);
 
-    // Calculate total score
-    const totalScore = wcApi.score + categoryCheck.score + productCountCheck.score +
-        homepage.score + cartPage.score + salesCheck.score;
-
-    // Build reasons
-    const reasons = [];
-
-    if (wcApi.hasDummyContent) {
-        reasons.push(`❌ DUMMY CONTENT detected: ${wcApi.dummyContentDetails.join('; ')}`);
-    }
-    if (wcApi.apiAccessible) {
-        reasons.push(`API: ${wcApi.productCount} products, ${wcApi.productsWithPrice} with price (score: ${wcApi.score})`);
-    } else {
-        reasons.push(`API: not accessible (score: ${wcApi.score})`);
-    }
-    if (categoryCheck.isNonEcommCategory) {
-        reasons.push(`❌ Non-ecommerce category: "${categoryCheck.matchedCategory}" (score: ${categoryCheck.score})`);
-    }
-    if (categoryCheck.isNonEcommDescription) {
-        reasons.push(`❌ Non-ecommerce description keyword: "${categoryCheck.matchedDescKeyword}" (score: ${categoryCheck.score})`);
-    }
-    reasons.push(`Products sold: ${productCountCheck.productsSold} (score: ${productCountCheck.score})`);
-    reasons.push(`Monthly sales: $${salesCheck.monthlySales.toFixed(2)} (score: ${salesCheck.score})`);
-    reasons.push(`Homepage signals: shop=${homepage.hasShopLink}, prices=${homepage.hasProductPrices}, cart=${homepage.hasCartLink}, woo=${homepage.hasWooProductMarkup} (score: ${homepage.score})`);
-    reasons.push(`Cart page: ${cartPage.hasWooCartMarkup ? 'has WC markup' : 'no WC markup'} (score: ${cartPage.score})`);
-
+    const totalScore = wcApi.score + catScore + prodScore + homepage.score + cartScore + salesScore;
     const passed = totalScore >= CONFIG.passThreshold;
-    const verdict = passed ? '✅ KEEP — Real ecommerce store' : '❌ REMOVE — Not a real ecommerce store';
-
-    // Print results
-    console.log(`\n📊 Score breakdown:`);
-    console.log(`   WC API:        ${String(wcApi.score).padStart(4)}`);
-    console.log(`   Category/Desc: ${String(categoryCheck.score).padStart(4)}`);
-    console.log(`   Product Count: ${String(productCountCheck.score).padStart(4)}`);
-    console.log(`   Homepage:      ${String(homepage.score).padStart(4)}`);
-    console.log(`   Cart Page:     ${String(cartPage.score).padStart(4)}`);
-    console.log(`   Monthly Sales: ${String(salesCheck.score).padStart(4)}`);
-    console.log(`   ─────────────────────`);
-    console.log(`   TOTAL:         ${String(totalScore).padStart(4)} (threshold: ${CONFIG.passThreshold})`);
-    console.log(`\n   ${verdict}`);
 
     return {
         totalScore,
         passed,
-        verdict,
-        reasons: reasons.join(' | '),
-        details: { wcApi, categoryCheck, productCountCheck, homepage, cartPage, salesCheck },
+        verdict: passed ? 'KEEP' : 'REMOVE',
     };
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONCURRENT BATCH PROCESSOR
+// ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Prompt user for input in the terminal.
- */
+async function processBatch(rows, concurrency) {
+    const results = [];
+    for (let i = 0; i < rows.length; i += concurrency) {
+        const batch = rows.slice(i, i + concurrency);
+        const batchResults = await Promise.all(batch.map(row => verifySite(row)));
+        for (let j = 0; j < batch.length; j++) {
+            const r = batchResults[j];
+            batch[j].woo_verified = r.passed ? 'YES' : 'NO';
+            batch[j].verification_score = String(r.totalScore);
+            batch[j].verification_reason = r.verdict;
+            results.push(batch[j]);
+        }
+    }
+    return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OUTPUT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function writeResultCSV(filePath, rows, headers) {
+    const lines = [headers.join(',')];
+    for (const row of rows) lines.push(rowToCSV(row, headers));
+    fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTERACTIVE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function askQuestion(question) {
     return new Promise((resolve) => {
         const readline = require('readline');
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question(question, (answer) => {
-            rl.close();
-            resolve(answer.trim());
-        });
+        rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
     });
 }
 
-/**
- * Wait for Enter key before closing the window.
- */
-function waitForEnter(message = '\nPressione ENTER para fechar...') {
+function waitForEnter(msg = '\nPressione ENTER para fechar...') {
     return new Promise((resolve) => {
         const readline = require('readline');
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question(message, () => {
-            rl.close();
-            resolve();
-        });
+        rl.question(msg, () => { rl.close(); resolve(); });
     });
 }
 
+function formatTime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════════════════════
+
 async function main() {
     console.log('╔══════════════════════════════════════════════════════════╗');
-    console.log('║    WooCommerce E-commerce Verifier                      ║');
-    console.log('║    Verifica se sites WooCommerce vendem de verdade       ║');
+    console.log('║    WooCommerce E-commerce Verifier v2                   ║');
+    console.log('║    Otimizado para listas grandes (80k+)                 ║');
     console.log('╚══════════════════════════════════════════════════════════╝\n');
 
     let inputFile = process.argv[2];
 
-    // If no file provided, ask the user
+    // Interactive file picker
     if (!inputFile) {
-        // List CSV files in the current directory
         const csvFiles = fs.readdirSync('.').filter(f => f.endsWith('.csv'));
         if (csvFiles.length > 0) {
             console.log('📋 Ficheiros CSV encontrados nesta pasta:\n');
             csvFiles.forEach((f, i) => console.log(`   ${i + 1}. ${f}`));
             console.log('');
             const answer = await askQuestion('Digite o número ou o nome do ficheiro CSV: ');
-
-            // Check if answer is a number (index)
             const idx = parseInt(answer, 10);
-            if (idx >= 1 && idx <= csvFiles.length) {
-                inputFile = csvFiles[idx - 1];
-            } else {
-                inputFile = answer;
-            }
+            inputFile = (idx >= 1 && idx <= csvFiles.length) ? csvFiles[idx - 1] : answer;
         } else {
             inputFile = await askQuestion('Digite o nome do ficheiro CSV: ');
         }
     }
 
-    // Validate input file
     if (!inputFile || !fs.existsSync(inputFile)) {
         console.error(`\n❌ Ficheiro não encontrado: "${inputFile}"`);
-        console.error('   Coloque o ficheiro CSV na mesma pasta que este script.');
         await waitForEnter();
         process.exit(1);
     }
 
+    // ─── Read CSV ────────────────────────────────────────────────────────────────
     console.log(`\n📂 A ler: ${inputFile}`);
     const csvText = fs.readFileSync(inputFile, 'utf-8');
-    const rows = parseCSV(csvText);
-    console.log(`📋 ${rows.length} leads encontrados para verificar\n`);
+    const { headers, rows } = parseCSV(csvText);
+    console.log(`📋 ${rows.length} leads encontrados\n`);
 
-    // Get headers from original file
-    const firstLine = csvText.split(/\r?\n/)[0];
-    const headers = splitCSVLine(firstLine);
-
-    // Add new columns if not present
+    // Add output columns
     if (!headers.includes('woo_verified')) headers.push('woo_verified');
     if (!headers.includes('woo_check_date')) headers.push('woo_check_date');
     if (!headers.includes('verification_score')) headers.push('verification_score');
     if (!headers.includes('verification_reason')) headers.push('verification_reason');
 
-    const results = [];
+    // ─── Setup results folder ────────────────────────────────────────────────────
+    const baseName = path.basename(inputFile, '.csv');
+    const resultsDir = path.join(path.dirname(inputFile) || '.', `results_${baseName}`);
+    if (!fs.existsSync(resultsDir)) fs.mkdirSync(resultsDir, { recursive: true });
+    const progressFile = path.join(resultsDir, '_progress.json');
+
+    // ─── Check for resume ────────────────────────────────────────────────────────
+    let alreadyChecked = new Set();
+    if (fs.existsSync(progressFile)) {
+        const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+        alreadyChecked = new Set(progress.checked || []);
+        console.log(`🔄 Progresso anterior encontrado: ${alreadyChecked.size} sites já verificados`);
+        console.log(`   A continuar de onde parou...\n`);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════
+    // PHASE 1: Pre-filtering (instant)
+    // ═════════════════════════════════════════════════════════════════════════════
+    console.log('━'.repeat(60));
+    console.log('⚡ FASE 1: Pré-filtragem (dados da planilha, sem HTTP)');
+    console.log('━'.repeat(60));
+
     const today = new Date().toISOString().split('T')[0];
+    const keepForHTTP = [];
+    const preFilterRemoved = [];
 
-    for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        console.log(`\n⏳ [${i + 1}/${rows.length}] A verificar ${row.domain || row.domain_url}...`);
+    for (const row of rows) {
+        const domain = row.domain || '';
 
-        const verification = await verifySite(row);
+        // Skip if already processed in a previous run
+        if (alreadyChecked.has(domain)) continue;
 
-        row.woo_verified = verification.passed ? 'YES' : 'NO';
-        row.woo_check_date = today;
-        row.verification_score = String(verification.totalScore);
-        row.verification_reason = verification.verdict;
-
-        results.push(row);
-
-        // Delay between sites to be polite
-        if (i < rows.length - 1) {
-            await sleep(CONFIG.delayBetweenSites);
+        const filter = preFilterRow(row);
+        if (!filter.pass) {
+            row.woo_verified = 'NO';
+            row.woo_check_date = today;
+            row.verification_score = '-';
+            row.verification_reason = filter.reason;
+            preFilterRemoved.push(row);
+        } else {
+            keepForHTTP.push(row);
         }
     }
 
-    // ─── Create results folder ──────────────────────────────────────────────────
-    const baseName = path.basename(inputFile, '.csv');
-    const resultsDir = path.join(path.dirname(inputFile) || '.', `results_${baseName}`);
+    console.log(`\n   ❌ Removidos pela pré-filtragem: ${preFilterRemoved.length}`);
+    console.log(`   ✅ Precisam de verificação HTTP:  ${keepForHTTP.length}`);
 
-    if (!fs.existsSync(resultsDir)) {
-        fs.mkdirSync(resultsDir, { recursive: true });
-    }
+    // Estimate time
+    const estimatedSeconds = (keepForHTTP.length / CONFIG.concurrency) * 3; // ~3s per batch
+    console.log(`   ⏱️  Tempo estimado: ~${formatTime(estimatedSeconds)}`);
 
-    const kept = results.filter(r => r.woo_verified === 'YES');
-    const removed = results.filter(r => r.woo_verified === 'NO');
+    // ═════════════════════════════════════════════════════════════════════════════
+    // PHASE 2: HTTP verification (concurrent)
+    // ═════════════════════════════════════════════════════════════════════════════
+    console.log(`\n${'━'.repeat(60)}`);
+    console.log(`🌐 FASE 2: Verificação HTTP (${CONFIG.concurrency} sites em paralelo)`);
+    console.log('━'.repeat(60));
 
-    // Write KEEP CSV
+    const httpKeep = [];
+    const httpRemove = [];
+    const startTime = Date.now();
+    let processed = 0;
+
+    // Load previous results if resuming
     const keepFile = path.join(resultsDir, `KEEP_${baseName}.csv`);
-    const keepLines = [headers.join(',')];
-    for (const row of kept) {
-        keepLines.push(rowToCSV(row, headers));
-    }
-    fs.writeFileSync(keepFile, keepLines.join('\n'), 'utf-8');
-
-    // Write REMOVE CSV
     const removeFile = path.join(resultsDir, `REMOVE_${baseName}.csv`);
-    const removeLines = [headers.join(',')];
-    for (const row of removed) {
-        removeLines.push(rowToCSV(row, headers));
-    }
-    fs.writeFileSync(removeFile, removeLines.join('\n'), 'utf-8');
 
-    // ─── Print summary ──────────────────────────────────────────────────────────
+    if (alreadyChecked.size > 0) {
+        // Re-read previous results
+        if (fs.existsSync(keepFile)) {
+            const prev = parseCSV(fs.readFileSync(keepFile, 'utf-8'));
+            httpKeep.push(...prev.rows);
+        }
+        if (fs.existsSync(removeFile)) {
+            const prev = parseCSV(fs.readFileSync(removeFile, 'utf-8'));
+            httpRemove.push(...prev.rows);
+        }
+    }
+
+    for (let i = 0; i < keepForHTTP.length; i += CONFIG.concurrency) {
+        const batch = keepForHTTP.slice(i, i + CONFIG.concurrency);
+        const batchDomains = batch.map(r => r.domain || '???').join(', ');
+
+        // Progress display
+        const pct = Math.round(((processed) / keepForHTTP.length) * 100);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const rate = processed > 0 ? elapsed / processed : 3;
+        const remaining = (keepForHTTP.length - processed) * rate;
+
+        process.stdout.write(`\r   ⏳ ${processed}/${keepForHTTP.length} (${pct}%) | Restante: ~${formatTime(remaining)}   `);
+
+        // Process batch concurrently
+        const batchResults = await Promise.all(batch.map(row => verifySite(row)));
+
+        for (let j = 0; j < batch.length; j++) {
+            const row = batch[j];
+            const r = batchResults[j];
+            row.woo_verified = r.passed ? 'YES' : 'NO';
+            row.woo_check_date = today;
+            row.verification_score = String(r.totalScore);
+            row.verification_reason = r.verdict;
+
+            if (r.passed) httpKeep.push(row);
+            else httpRemove.push(row);
+
+            alreadyChecked.add(row.domain || '');
+        }
+
+        processed += batch.length;
+
+        // Save progress periodically
+        if (processed % CONFIG.saveEvery === 0 || i + CONFIG.concurrency >= keepForHTTP.length) {
+            writeResultCSV(keepFile, httpKeep, headers);
+            writeResultCSV(removeFile, [...preFilterRemoved, ...httpRemove], headers);
+            fs.writeFileSync(progressFile, JSON.stringify({
+                checked: [...alreadyChecked],
+                lastUpdate: new Date().toISOString(),
+            }), 'utf-8');
+        }
+    }
+
+    // ─── Final save ──────────────────────────────────────────────────────────────
+    const allRemoved = [...preFilterRemoved, ...httpRemove];
+    writeResultCSV(keepFile, httpKeep, headers);
+    writeResultCSV(removeFile, allRemoved, headers);
+
+    // Clean up progress file on completion
+    if (fs.existsSync(progressFile)) fs.unlinkSync(progressFile);
+
+    // ─── Summary ─────────────────────────────────────────────────────────────────
+    const totalTime = (Date.now() - startTime) / 1000;
+
     console.log(`\n\n${'═'.repeat(60)}`);
     console.log(`📊 RESUMO FINAL`);
     console.log(`${'═'.repeat(60)}`);
-
-    console.log(`\n✅ MANTER (${kept.length}):`);
-    for (const r of kept) {
-        console.log(`   • ${r.domain} (score: ${r.verification_score})`);
-    }
-
-    console.log(`\n❌ REMOVER (${removed.length}):`);
-    for (const r of removed) {
-        console.log(`   • ${r.domain} (score: ${r.verification_score})`);
-    }
-
+    console.log(`\n   Total analisados:     ${rows.length}`);
+    console.log(`   Pré-filtrados (inst): ${preFilterRemoved.length}`);
+    console.log(`   Verificados (HTTP):   ${keepForHTTP.length}`);
+    console.log(`   Tempo total:          ${formatTime(totalTime)}`);
+    console.log(`\n   ✅ MANTER:  ${httpKeep.length} leads`);
+    console.log(`   ❌ REMOVER: ${allRemoved.length} leads`);
     console.log(`\n${'─'.repeat(60)}`);
-    console.log(`📁 Resultados salvos em: ${resultsDir}/`);
-    console.log(`   ✅ ${keepFile}`);
-    console.log(`   ❌ ${removeFile}`);
+    console.log(`📁 Resultados em: ${resultsDir}/`);
+    console.log(`   ✅ KEEP_${baseName}.csv`);
+    console.log(`   ❌ REMOVE_${baseName}.csv`);
 
     await waitForEnter();
 }
