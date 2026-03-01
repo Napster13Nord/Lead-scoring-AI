@@ -169,13 +169,6 @@ function preFilterRow(row) {
         return { pass: false, reason: `Categoria "${matchedCat}" + descrição "${matchedDesc}" = não é ecommerce` };
     }
 
-    // 3) Sites with 0 products and very low estimated sales
-    const salesStr = (row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '');
-    const sales = parseFloat(salesStr) || 0;
-    if (productsSold === 0 && sales < 500) {
-        return { pass: false, reason: `0 produtos e vendas < $500/mês` };
-    }
-
     return { pass: true, reason: '' };
 }
 
