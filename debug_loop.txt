@@ -4047,3 +4047,5 @@ Started batch 9300. URLs: capitalcaptions.com,car-team.co.uk,thecareeracademy.co
 Finished batch 9300!
 
 Started batch 9310. URLs: chrisgarlandtraining.co.uk,clickliveexpo.co.uk,cloudone.net,cognisys.co.uk,www.collectorsprints.co.uk,www.colourtone.com,commpassion.co.uk,complyportal.uk,www.concoursvehicles.co.uk,www.concretecarrot.uk
+
+Started batch 0. URLs: chrisgarlandtraining.co.uk,clickliveexpo.co.uk,cloudone.net,cognisys.co.uk,www.collectorsprints.co.uk,www.colourtone.com,commpassion.co.uk,complyportal.uk,www.concoursvehicles.co.uk,www.concretecarrot.uk

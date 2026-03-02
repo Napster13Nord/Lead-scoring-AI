@@ -131,20 +131,38 @@ function writeCSV(filePath, rows, headers) {
 // Set higher max listeners on process globally just in case (optional, but good practice for high-concurrency)
 require('events').EventEmitter.defaultMaxListeners = 100;
 
+// Prevent MaxListenersExceededWarning when fetching many domains at once
+require('events').EventEmitter.defaultMaxListeners = 100;
+process.removeAllListeners('warning'); // Suppress node warnings that don't crash the script
+
 async function safeFetch(url) {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
         url = 'https://' + url;
     }
 
-    // Use Node's built-in AbortSignal.timeout which correctly manages internal listeners
-    const signal = AbortSignal.timeout(CONFIG.requestTimeout);
+    const controller = new AbortController();
+    let timeoutId;
 
-    try {
-        const res = await fetch(url, { signal, headers: { 'User-Agent': CONFIG.userAgent } });
-        return res;
-    } catch {
-        return null;
-    }
+    // Explicit timeout that forces a resolution to null if fetch hangs
+    const timeoutPromise = new Promise(resolve => {
+        timeoutId = setTimeout(() => {
+            try { controller.abort(); } catch { }
+            resolve(null);
+        }, CONFIG.requestTimeout);
+    });
+
+    // The fetch request
+    const fetchPromise = fetch(url, { signal: controller.signal, headers: { 'User-Agent': CONFIG.userAgent } })
+        .catch(() => null);
+
+    // Race them: if fetch hangs, timeoutPromise wins and frees the event loop
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
+
+    // Cleanup the timer whether we timed out or succeeded fast
+    clearTimeout(timeoutId);
+
+    // If res is not a Response object (i.e. we matched timeout or an error caught), return null
+    return (res && typeof res.status === 'number') ? res : null;
 }
 
 function formatTime(seconds) {
