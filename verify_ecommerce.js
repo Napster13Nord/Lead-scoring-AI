@@ -128,16 +128,23 @@ function writeCSV(filePath, rows, headers) {
     }
 }
 
+// Set higher max listeners on process globally just in case (optional, but good practice for high-concurrency)
+require('events').EventEmitter.defaultMaxListeners = 100;
+
 async function safeFetch(url) {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
         url = 'https://' + url;
     }
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeout);
+
+    // Use Node's built-in AbortSignal.timeout which correctly manages internal listeners
+    const signal = AbortSignal.timeout(CONFIG.requestTimeout);
+
     try {
-        const res = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': CONFIG.userAgent } });
-        clearTimeout(timeout); return res;
-    } catch { clearTimeout(timeout); return null; }
+        const res = await fetch(url, { signal, headers: { 'User-Agent': CONFIG.userAgent } });
+        return res;
+    } catch {
+        return null;
+    }
 }
 
 function formatTime(seconds) {
