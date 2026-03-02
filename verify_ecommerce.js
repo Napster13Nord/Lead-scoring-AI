@@ -105,12 +105,33 @@ function escapeCSV(value) {
 function rowToCSV(row, headers) { return headers.map(h => escapeCSV(row[h])).join(','); }
 
 function writeCSV(filePath, rows, headers) {
-    const lines = [headers.join(',')];
-    for (const row of rows) lines.push(rowToCSV(row, headers));
-    fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
+    if (rows.length === 0) return;
+    try {
+        const lines = [headers.join(',')];
+        for (const row of rows) {
+            const line = headers.map(h => {
+                let val = row[h] || '';
+                if (typeof val === 'string' && (val.includes(',') || val.includes('"') || val.includes('\n'))) {
+                    val = `"${val.replace(/"/g, '""')}"`;
+                }
+                return val;
+            });
+            lines.push(line.join(','));
+        }
+        fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
+    } catch (e) {
+        if (e.code === 'EBUSY' || e.code === 'EPERM') {
+            console.error(`\n   ⚠️ AVISO: Nao foi possivel guardar em ${path.basename(filePath)} porque o ficheiro esta aberto noutro programa (ex: Excel). Feche o ficheiro!`);
+        } else {
+            console.error(`\n   ⚠️ Erro ao guardar CSV: ${e.message}`);
+        }
+    }
 }
 
 async function safeFetch(url) {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'https://' + url;
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeout);
     try {
@@ -233,15 +254,13 @@ async function scoreCart(url) {
     return (l.includes('woocommerce-cart') || l.includes('wc-cart') || l.includes('cart-empty')) ? 10 : -5;
 }
 
-/** Verify one site. Wrapped in try/catch so one bad site never crashes the batch. */
 async function verifySite(row) {
     try {
-        const url = row.domain_url || '';
+        const url = row.domain || row.domain_url || '';
         const [wcApi, hpScore, cartScore] = await Promise.all([checkWCStoreAPI(url), scoreHomepage(url), scoreCart(url)]);
         const total = wcApi.score + scoreCategoryDesc(row, wcApi) + scoreProducts(row) + hpScore + cartScore + scoreSales(row);
         return { totalScore: total, passed: total >= CONFIG.passThreshold, verdict: total >= CONFIG.passThreshold ? 'KEEP' : 'REMOVE' };
     } catch (e) {
-        // If anything fails for this site, mark as REMOVE with score 0
         return { totalScore: 0, passed: false, verdict: 'REMOVE (erro)' };
     }
 }
@@ -517,8 +536,11 @@ async function main() {
             // Process batch — each site is individually wrapped in try/catch
             let batchResults;
             try {
+                fs.appendFileSync('debug_loop.txt', `\nStarted batch ${i}. URLs: ${batch.map(r => r.domain).join(',')}\n`);
                 batchResults = await Promise.all(batch.map(row => verifySite(row)));
+                fs.appendFileSync('debug_loop.txt', `Finished batch ${i}!\n`);
             } catch (e) {
+                fs.appendFileSync('debug_loop.txt', `Erro batch ${i}: ${e.message}\n`);
                 // Entire batch failed (very unlikely), mark all as error
                 batchResults = batch.map(() => ({ totalScore: 0, passed: false, verdict: 'REMOVE (erro batch)' }));
                 errors++;

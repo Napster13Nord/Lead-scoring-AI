@@ -1,0 +1,13 @@
+[2026-03-02T08:38:04.828Z] CRASH:
+Error: EBUSY: resource busy or locked, open 'C:\Users\André - Business\Desktop\Vibe Coding\LeadScoring AI\results_02_clean_with_linkedin_GB\REMOVE_02_clean_with_linkedin_GB.csv'
+    at Object.writeFileSync (node:fs:2426:20)
+    at writeCSV (C:\Users\André - Business\Desktop\Vibe Coding\LeadScoring AI\verify_ecommerce.js:110:8)
+    at main (C:\Users\André - Business\Desktop\Vibe Coding\LeadScoring AI\verify_ecommerce.js:568:5)
+    at Object.<anonymous> (C:\Users\André - Business\Desktop\Vibe Coding\LeadScoring AI\verify_ecommerce.js:633:1)
+    at Module._compile (node:internal/modules/cjs/loader:1554:14)
+    at Object..js (node:internal/modules/cjs/loader:1706:10)
+    at Module.load (node:internal/modules/cjs/loader:1289:32)
+    at Function._load (node:internal/modules/cjs/loader:1108:12)
+    at TracingChannel.traceSync (node:diagnostics_channel:322:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:220:24)
+

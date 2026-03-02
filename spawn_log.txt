@@ -1,0 +1,26 @@
+╔══════════════════════════════════════════════════════════╗
+║    WooCommerce E-commerce Verifier v3                   ║
+║    Resume robusto + Relatorio final                     ║
+╚══════════════════════════════════════════════════════════╝
+
+📂 A ler: 02_clean_with_linkedin_GB.csv
+📋 14558 leads encontrados
+
+🔄 Progresso anterior: 10381 sites ja verificados
+   A continuar de onde parou...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ FASE 1: Classificacao (pre-filtragem + progresso anterior)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   Progresso anterior:    10381
+   Pre-filtrados (.org):  0
+   Pre-filtrados (categ): 0
+   Precisam HTTP:         4171
+   Tempo estimado:        ~20m 51s
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🌐 FASE 2: Verificacao HTTP (10 em paralelo)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ⏳ 0/4171 (0%) | KEEP: 0 | REMOVE: 0 | Restante: ~3h 28m 33s   
+EXIT CODE: 0
