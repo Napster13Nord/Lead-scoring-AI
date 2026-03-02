@@ -376,22 +376,33 @@ async function main() {
     // ─── Pick input file ─────────────────────────────────────────────────────────
     let inputFile = process.argv[2];
     if (!inputFile) {
-        const csvFiles = fs.readdirSync('.').filter(f => f.endsWith('.csv') && !f.startsWith('KEEP_') && !f.startsWith('REMOVE_'));
-        if (csvFiles.length > 0) {
-            console.log('📋 Ficheiros CSV encontrados:\n');
-            csvFiles.forEach((f, i) => console.log(`   ${i + 1}. ${f}`));
-            console.log('');
-            const answer = await askQuestion('Digite o numero ou o nome do CSV: ');
-            const idx = parseInt(answer, 10);
-            inputFile = (idx >= 1 && idx <= csvFiles.length) ? csvFiles[idx - 1] : answer;
+        // Auto-detect: find CSV files (exclude output files)
+        const csvFiles = fs.readdirSync('.').filter(f =>
+            f.endsWith('.csv') && !f.startsWith('KEEP_') && !f.startsWith('REMOVE_')
+        );
+
+        if (csvFiles.length === 1) {
+            inputFile = csvFiles[0];
+            console.log(`� CSV auto-detectado: ${inputFile}`);
+        } else if (csvFiles.length > 1) {
+            // Pick the largest CSV (most likely the main leads file)
+            let biggest = csvFiles[0], biggestSize = 0;
+            for (const f of csvFiles) {
+                const size = fs.statSync(f).size;
+                if (size > biggestSize) { biggest = f; biggestSize = size; }
+            }
+            inputFile = biggest;
+            console.log(`📂 ${csvFiles.length} CSVs encontrados, a usar o maior: ${inputFile}`);
         } else {
-            inputFile = await askQuestion('Nome do ficheiro CSV: ');
+            console.error('\n❌ Nenhum ficheiro CSV encontrado nesta pasta.');
+            console.error('   Coloque o CSV na mesma pasta que o script.');
+            process.exit(1);
         }
     }
 
     if (!inputFile || !fs.existsSync(inputFile)) {
         console.error(`\n❌ Ficheiro nao encontrado: "${inputFile}"`);
-        await waitForEnter(); process.exit(1);
+        process.exit(1);
     }
 
     // ─── Read CSV ────────────────────────────────────────────────────────────────
