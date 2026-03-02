@@ -593,15 +593,10 @@ async function main() {
         console.log(`\n   🎉 Verificacao completa!`);
     }
 
-    await waitForEnter();
 }
 
-main().catch(async (err) => {
+main().catch((err) => {
     console.error('\n❌ Erro fatal:', err.message || err);
     console.error(err.stack || '');
-    try {
-        const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-        await new Promise(r => rl.question('\nPressione ENTER para fechar...', () => { rl.close(); r(); }));
-    } catch { }
     process.exit(1);
 });

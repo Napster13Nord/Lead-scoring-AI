@@ -26,3 +26,14 @@ if "%~1"=="" (
 ) else (
     node verify_ecommerce.js "%~1"
 )
+
+REM If node crashed, keep the window open so user can see the error
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo ============================================
+    echo  ERRO: O script terminou com erro.
+    echo  Codigo de erro: %ERRORLEVEL%
+    echo ============================================
+    echo.
+)
+pause
