@@ -1,16 +1,14 @@
 #!/usr/bin/env node
 /**
- * WooCommerce E-commerce Verifier (v2 — Optimized for large lists)
+ * WooCommerce E-commerce Verifier v3
  * 
  * Reads a CSV of StoreLeads data and verifies which sites are REAL e-commerce stores.
- * Optimized for 80k+ contacts with:
- *  - Instant pre-filtering (removes .org, obvious non-ecommerce from CSV data alone)
- *  - Concurrent HTTP verification (10 sites at a time)
- *  - Resume capability (saves progress every batch)
+ * Optimized for large lists (14k-80k+) with:
+ *  - Instant pre-filtering (.org removal, obvious non-ecommerce)
+ *  - Concurrent HTTP verification (10 at a time)
+ *  - Bulletproof resume (saves per-domain results, never loses progress)
+ *  - Final report with stats
  *  - Two output CSVs: KEEP and REMOVE
- * 
- * Usage: node verify_ecommerce.js <input.csv>
- *    or: double-click VERIFICAR.bat
  */
 
 const fs = require('fs');
@@ -21,69 +19,46 @@ const CONFIG = {
     requestTimeout: 8000,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     passThreshold: 45,
-    // Concurrency: how many sites to check at the same time
     concurrency: 10,
-    // Save progress every N sites
-    saveEvery: 50,
+    saveEvery: 25,
 };
 
 // ─── Domains to auto-remove ──────────────────────────────────────────────────────
 const BLOCKED_TLDS = ['.org', '.org.uk'];
 
 // ─── Non-ecommerce category keywords (matched against StoreLeads categories) ────
-// These are broad keywords that match StoreLeads paths like "/Internet/Voice & Video Chat"
 const NON_ECOMMERCE_CATEGORIES = [
-    // Telecom / VoIP
     'voice & video chat', 'voip', 'telecom', 'telecommunications',
-    // Nonprofits / Charities / Advocacy
     'social issues', 'advocacy', 'nonprofit', 'charity', 'foundation',
-    // Government / Public
     'government', 'municipality', 'public agency', 'military',
-    // Professional Services (no products sold online)
     'law', 'legal services', 'accounting', 'financial advisory',
     'insurance', 'architecture', 'engineering firm',
     'consulting', 'business operations',
-    // Local Services (no online checkout)
     'restaurant', 'cafe', 'bar', 'barbershop', 'salon', 'spa',
     'plumbing', 'electrician', 'landscaping', 'construction', 'scaffolding',
-    // Healthcare (informational)
     'hospital', 'clinic', 'dental', 'therapy', 'mental health',
-    // Real Estate
     'real estate',
-    // Media / Entertainment (no store)
     'streaming', 'radio station', 'tv channel',
     'photography portfolio', 'art portfolio',
-    // Directories / Aggregators
     'business directory', 'job board', 'classified ads', 'review site', 'coupon site',
-    // Recruitment / Staffing
     'recruitment', 'staffing', 'employment',
-    // Internet / Hosting
     'web hosting', 'saas',
-    // Events only
     'conference', 'meetup', 'wedding',
 ];
 
 // ─── Non-ecommerce description keywords ─────────────────────────────────────────
-// Strong signals in the site description that it's NOT selling products
 const NON_ECOMMERCE_DESCRIPTION_KEYWORDS = [
-    // Telecom / VoIP
     'voip', 'telephone system', 'phone system', 'voip telephone',
-    // Recruitment
     'recruitment solution', 'recruitment solutions', 'we provide recruitment',
-    // Film / Media
     'impact strategy', 'film community', 'documentary', 'sundance', 'international film',
-    // Construction / Engineering
     'scaffolding', 'engineering & design', 'access scaffolding',
-    // Nonprofit / Charity
     'charity', 'donate', 'donation',
-    // Professional services
     'law firm', 'legal advice', 'financial advisory',
-    // Dev / Test / Demo
     'demo site', 'test site', 'staging site', 'under construction', 'coming soon',
     'plugin demo', 'theme demo', 'woocommerce demo',
 ];
 
-// ─── Lorem ipsum / dummy content patterns ────────────────────────────────────────
+// ─── Dummy content patterns ─────────────────────────────────────────────────────
 const DUMMY_CONTENT_PATTERNS = [
     'lorem ipsum', 'dolor sit amet', 'consectetur adipiscing',
     'vestibulum tempus', 'fusce quis', 'etiam ultricies',
@@ -91,29 +66,21 @@ const DUMMY_CONTENT_PATTERNS = [
     'this is a test', 'placeholder', 'example product',
 ];
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function splitCSVLine(line) {
-    const fields = [];
-    let current = '';
-    let inQuotes = false;
+    const fields = []; let current = '', inQuotes = false;
     for (let i = 0; i < line.length; i++) {
         const ch = line[i];
-        if (ch === '"') {
-            if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
-            else { inQuotes = !inQuotes; }
-        } else if (ch === ',' && !inQuotes) {
-            fields.push(current); current = '';
-        } else {
-            current += ch;
-        }
+        if (ch === '"') { if (inQuotes && line[i + 1] === '"') { current += '"'; i++; } else inQuotes = !inQuotes; }
+        else if (ch === ',' && !inQuotes) { fields.push(current); current = ''; }
+        else current += ch;
     }
-    fields.push(current);
-    return fields;
+    fields.push(current); return fields;
 }
 
 function parseCSV(text) {
@@ -124,274 +91,276 @@ function parseCSV(text) {
     for (let i = 1; i < lines.length; i++) {
         const values = splitCSVLine(lines[i]);
         const row = {};
-        for (let j = 0; j < headers.length; j++) {
-            row[headers[j]] = values[j] || '';
-        }
+        for (let j = 0; j < headers.length; j++) row[headers[j]] = values[j] || '';
         rows.push(row);
     }
     return { headers, rows };
 }
 
-function escapeCSVField(value) {
-    const str = String(value ?? '');
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-        return '"' + str.replace(/"/g, '""') + '"';
-    }
-    return str;
+function escapeCSV(value) {
+    const s = String(value ?? '');
+    return (s.includes(',') || s.includes('"') || s.includes('\n')) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-function rowToCSV(row, headers) {
-    return headers.map(h => escapeCSVField(row[h])).join(',');
+function rowToCSV(row, headers) { return headers.map(h => escapeCSV(row[h])).join(','); }
+
+function writeCSV(filePath, rows, headers) {
+    const lines = [headers.join(',')];
+    for (const row of rows) lines.push(rowToCSV(row, headers));
+    fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
 }
 
-async function safeFetch(url, options = {}) {
+async function safeFetch(url) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CONFIG.requestTimeout);
     try {
-        const res = await fetch(url, {
-            ...options,
-            signal: controller.signal,
-            headers: { 'User-Agent': CONFIG.userAgent, ...(options.headers || {}) },
-        });
-        clearTimeout(timeout);
-        return res;
-    } catch (e) {
-        clearTimeout(timeout);
-        return null;
-    }
+        const res = await fetch(url, { signal: controller.signal, headers: { 'User-Agent': CONFIG.userAgent } });
+        clearTimeout(timeout); return res;
+    } catch { clearTimeout(timeout); return null; }
+}
+
+function formatTime(seconds) {
+    const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+function askQuestion(q) {
+    return new Promise(r => { const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout }); rl.question(q, a => { rl.close(); r(a.trim()); }); });
+}
+
+function waitForEnter(msg = '\nPressione ENTER para fechar...') {
+    return new Promise(r => { const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout }); rl.question(msg, () => { rl.close(); r(); }); });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 1: CSV-only pre-filtering (instant, no HTTP requests)
+// PRE-FILTER (instant, no HTTP)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function preFilterRow(row) {
     const domain = (row.domain || row.domain_url || '').toLowerCase();
 
-    // 1) Block .org TLDs
     for (const tld of BLOCKED_TLDS) {
-        if (domain.endsWith(tld) || domain.includes(tld + '/')) {
+        if (domain.endsWith(tld) || domain.includes(tld + '/'))
             return { pass: false, reason: `Dominio ${tld} — auto-removido` };
-        }
     }
 
-    // 2) Check category + description combo (strongest signal)
     const categories = (row.categories || '').toLowerCase();
     const description = (row.description || row.meta_description || '').toLowerCase();
     const title = (row.title || '').toLowerCase();
     const allText = `${categories} ${description} ${title}`;
 
-    let hasNonEcommCategory = false;
-    let matchedCat = '';
-    for (const kw of NON_ECOMMERCE_CATEGORIES) {
-        if (categories.includes(kw)) { hasNonEcommCategory = true; matchedCat = kw; break; }
-    }
+    let matchedCat = '', matchedDesc = '';
+    for (const kw of NON_ECOMMERCE_CATEGORIES) { if (categories.includes(kw)) { matchedCat = kw; break; } }
+    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) { if (allText.includes(kw)) { matchedDesc = kw; break; } }
 
-    let hasNonEcommDesc = false;
-    let matchedDesc = '';
-    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) {
-        if (allText.includes(kw)) { hasNonEcommDesc = true; matchedDesc = kw; break; }
-    }
-
-    // If BOTH category and description match non-ecommerce → instant remove
     const productsSold = parseInt(row.products_sold || '0', 10);
-    if (hasNonEcommCategory && hasNonEcommDesc && productsSold < 50) {
-        return { pass: false, reason: `Categoria "${matchedCat}" + descrição "${matchedDesc}" = não é ecommerce` };
+    if (matchedCat && matchedDesc && productsSold < 50) {
+        return { pass: false, reason: `Categoria "${matchedCat}" + desc "${matchedDesc}"` };
     }
 
     return { pass: true, reason: '' };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 2: HTTP-based verification checks
+// HTTP VERIFICATION CHECKS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function checkWCStoreAPI(domainUrl) {
-    const baseUrl = domainUrl.replace(/\/+$/, '');
-    const result = {
-        apiAccessible: false, productCount: 0, productsWithPrice: 0,
-        hasAddToCart: false, hasDummyContent: false, dummyContentDetails: [], score: 0
-    };
-
-    const res = await safeFetch(`${baseUrl}/wp-json/wc/store/products?per_page=10`);
+    const result = { productsWithPrice: 0, hasAddToCart: false, hasDummyContent: false, score: 0 };
+    const res = await safeFetch(`${domainUrl.replace(/\/+$/, '')}/wp-json/wc/store/products?per_page=10`);
     if (!res || res.status !== 200) return result;
-
     let products;
-    try { products = await res.json(); if (!Array.isArray(products)) return result; }
-    catch { return result; }
-
-    result.apiAccessible = true;
-    result.productCount = products.length;
+    try { products = await res.json(); if (!Array.isArray(products)) return result; } catch { return result; }
 
     for (const p of products) {
         const allText = `${p.name || ''} ${p.short_description || ''} ${p.description || ''}`.toLowerCase();
         const price = parseFloat(p.prices?.price || 0);
-        const regular = parseFloat(p.prices?.regular_price || 0);
-        if (price > 0 || regular > 0) result.productsWithPrice++;
-        const cartText = (p.add_to_cart?.text || '').toLowerCase();
-        if (cartText.includes('add to cart') || cartText.includes('add to basket')) result.hasAddToCart = true;
-        for (const pat of DUMMY_CONTENT_PATTERNS) {
-            if (allText.includes(pat)) { result.hasDummyContent = true; result.dummyContentDetails.push(pat); break; }
-        }
+        if (price > 0 || parseFloat(p.prices?.regular_price || 0) > 0) result.productsWithPrice++;
+        const ct = (p.add_to_cart?.text || '').toLowerCase();
+        if (ct.includes('add to cart') || ct.includes('add to basket')) result.hasAddToCart = true;
+        for (const pat of DUMMY_CONTENT_PATTERNS) { if (allText.includes(pat)) { result.hasDummyContent = true; break; } }
     }
 
     if (result.hasDummyContent) result.score = -50;
     else if (result.productsWithPrice > 0 && result.hasAddToCart) result.score = 30;
     else if (result.productsWithPrice > 0) result.score = 20;
-    else if (result.productCount > 0) result.score = 5;
-
+    else if (products.length > 0) result.score = 5;
     return result;
 }
 
-function checkCategoryAndDescription(row, wcApiResult) {
+function scoreCategoryDesc(row, wcApi) {
     const categories = (row.categories || '').toLowerCase();
-    const description = (row.description || row.meta_description || '').toLowerCase();
-    const title = (row.title || '').toLowerCase();
-    const allText = `${categories} ${description} ${title}`;
-
-    let isNonEcommCategory = false, isNonEcommDescription = false;
-    for (const kw of NON_ECOMMERCE_CATEGORIES) { if (categories.includes(kw)) { isNonEcommCategory = true; break; } }
-    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) { if (allText.includes(kw)) { isNonEcommDescription = true; break; } }
-
-    const csvProductCount = parseInt(row.products_sold || '0', 10);
-    const hasRealProducts = (wcApiResult && wcApiResult.productsWithPrice > 0 && !wcApiResult.hasDummyContent)
-        || csvProductCount >= 100;
-
-    if (isNonEcommCategory && isNonEcommDescription) return -50;
-    if (isNonEcommDescription) return -30;
-    if (isNonEcommCategory) return hasRealProducts ? -5 : -20;
+    const allText = `${categories} ${(row.description || row.meta_description || '')} ${row.title || ''}`.toLowerCase();
+    let isCat = false, isDesc = false;
+    for (const kw of NON_ECOMMERCE_CATEGORIES) { if (categories.includes(kw)) { isCat = true; break; } }
+    for (const kw of NON_ECOMMERCE_DESCRIPTION_KEYWORDS) { if (allText.includes(kw)) { isDesc = true; break; } }
+    const csvProds = parseInt(row.products_sold || '0', 10);
+    const hasReal = (wcApi && wcApi.productsWithPrice > 0 && !wcApi.hasDummyContent) || csvProds >= 100;
+    if (isCat && isDesc) return -50;
+    if (isDesc) return -30;
+    if (isCat) return hasReal ? -5 : -20;
     return 10;
 }
 
-function checkProductCount(row) {
+function scoreProducts(row) {
     const p = parseInt(row.products_sold || '0', 10);
-    if (p >= 100) return 25;
-    if (p >= 20) return 15;
-    if (p >= 5) return 5;
-    if (p > 0) return -5;
-    return -15;
+    if (p >= 100) return 25; if (p >= 20) return 15; if (p >= 5) return 5; if (p > 0) return -5; return -15;
 }
 
-function checkMonthlySales(row) {
-    const sales = parseFloat((row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '')) || 0;
-    if (sales >= 10000) return 20;
-    if (sales >= 1000) return 10;
-    if (sales >= 500) return 0;
-    return -10;
+function scoreSales(row) {
+    const s = parseFloat((row.estimated_monthly_sales || '').replace(/[^0-9.]/g, '')) || 0;
+    if (s >= 10000) return 20; if (s >= 1000) return 10; if (s >= 500) return 0; return -10;
 }
 
-async function checkHomepage(domainUrl) {
-    const result = { score: 0 };
-    const res = await safeFetch(domainUrl);
-    if (!res || res.status !== 200) { result.score = -10; return result; }
-    let html;
-    try { html = await res.text(); } catch { result.score = -10; return result; }
-    const lower = html.toLowerCase();
-    const signals = [
-        lower.includes('/shop') || lower.includes('/store') || lower.includes('/products'),
-        lower.includes('woocommerce-price-amount') || lower.includes('price-amount'),
-        lower.includes('/cart') || lower.includes('/basket') || lower.includes('cart-contents'),
-        lower.includes('add_to_cart_button') || lower.includes('woocommerce-loop') || lower.includes('product-category'),
-    ].filter(Boolean).length;
-    if (signals >= 3) result.score = 25;
-    else if (signals >= 2) result.score = 15;
-    else if (signals >= 1) result.score = 5;
-    else result.score = -10;
-    return result;
+async function scoreHomepage(url) {
+    const res = await safeFetch(url);
+    if (!res || res.status !== 200) return -10;
+    let html; try { html = await res.text(); } catch { return -10; }
+    const l = html.toLowerCase();
+    const n = [l.includes('/shop') || l.includes('/store') || l.includes('/products'),
+    l.includes('woocommerce-price-amount'), l.includes('/cart') || l.includes('cart-contents'),
+    l.includes('add_to_cart_button') || l.includes('woocommerce-loop')].filter(Boolean).length;
+    if (n >= 3) return 25; if (n >= 2) return 15; if (n >= 1) return 5; return -10;
 }
 
-async function checkCartPage(domainUrl) {
-    const res = await safeFetch(`${domainUrl.replace(/\/+$/, '')}/cart`);
+async function scoreCart(url) {
+    const res = await safeFetch(`${url.replace(/\/+$/, '')}/cart`);
     if (!res || res.status !== 200) return 0;
-    let html;
-    try { html = await res.text(); } catch { return -5; }
-    const lower = html.toLowerCase();
-    const hasWoo = lower.includes('woocommerce-cart') || lower.includes('woocommerce-checkout')
-        || lower.includes('wc-cart') || lower.includes('woocommerce_cart_nonce') || lower.includes('cart-empty');
-    return hasWoo ? 10 : -5;
+    let html; try { html = await res.text(); } catch { return -5; }
+    const l = html.toLowerCase();
+    return (l.includes('woocommerce-cart') || l.includes('wc-cart') || l.includes('cart-empty')) ? 10 : -5;
 }
 
-/** Full HTTP verification for one site. Returns { totalScore, passed, verdict } */
+/** Verify one site. Wrapped in try/catch so one bad site never crashes the batch. */
 async function verifySite(row) {
-    const domainUrl = row.domain_url || '';
-
-    const [wcApi, homepage, cartScore] = await Promise.all([
-        checkWCStoreAPI(domainUrl),
-        checkHomepage(domainUrl),
-        checkCartPage(domainUrl),
-    ]);
-
-    const catScore = checkCategoryAndDescription(row, wcApi);
-    const prodScore = checkProductCount(row);
-    const salesScore = checkMonthlySales(row);
-
-    const totalScore = wcApi.score + catScore + prodScore + homepage.score + cartScore + salesScore;
-    const passed = totalScore >= CONFIG.passThreshold;
-
-    return {
-        totalScore,
-        passed,
-        verdict: passed ? 'KEEP' : 'REMOVE',
-    };
+    try {
+        const url = row.domain_url || '';
+        const [wcApi, hpScore, cartScore] = await Promise.all([checkWCStoreAPI(url), scoreHomepage(url), scoreCart(url)]);
+        const total = wcApi.score + scoreCategoryDesc(row, wcApi) + scoreProducts(row) + hpScore + cartScore + scoreSales(row);
+        return { totalScore: total, passed: total >= CONFIG.passThreshold, verdict: total >= CONFIG.passThreshold ? 'KEEP' : 'REMOVE' };
+    } catch (e) {
+        // If anything fails for this site, mark as REMOVE with score 0
+        return { totalScore: 0, passed: false, verdict: 'REMOVE (erro)' };
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CONCURRENT BATCH PROCESSOR
+// PROGRESS SYSTEM (line-based, not JSON — handles 80k+ without issues)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function processBatch(rows, concurrency) {
-    const results = [];
-    for (let i = 0; i < rows.length; i += concurrency) {
-        const batch = rows.slice(i, i + concurrency);
-        const batchResults = await Promise.all(batch.map(row => verifySite(row)));
-        for (let j = 0; j < batch.length; j++) {
-            const r = batchResults[j];
-            batch[j].woo_verified = r.passed ? 'YES' : 'NO';
-            batch[j].verification_score = String(r.totalScore);
-            batch[j].verification_reason = r.verdict;
-            results.push(batch[j]);
+function loadProgress(progressFile, resultsDir, baseName) {
+    const results = new Map(); // domain -> { verified: YES/NO, score, reason }
+
+    // Check for NEW format (.tsv)
+    if (fs.existsSync(progressFile)) {
+        try {
+            const lines = fs.readFileSync(progressFile, 'utf-8').split('\n').filter(l => l.trim());
+            for (const line of lines) {
+                const parts = line.split('\t');
+                if (parts.length >= 4) {
+                    results.set(parts[0], { verified: parts[1], score: parts[2], reason: parts[3].trim() });
+                }
+            }
+            return results;
+        } catch (e) {
+            console.error('   ⚠️  Erro a ler progresso TSV, a verificar formato antigo...');
         }
     }
+
+    // Check for OLD format (_progress.json) — migrate from v2
+    const oldJsonFile = path.join(resultsDir, '_progress.json');
+    if (fs.existsSync(oldJsonFile)) {
+        console.log('   🔄 Migrando progresso do formato antigo (v2)...');
+        try {
+            // Read the old KEEP/REMOVE CSVs to get actual results per domain
+            const keepCsv = path.join(resultsDir, `KEEP_${baseName}.csv`);
+            const removeCsv = path.join(resultsDir, `REMOVE_${baseName}.csv`);
+
+            if (fs.existsSync(keepCsv)) {
+                const { rows } = parseCSV(fs.readFileSync(keepCsv, 'utf-8'));
+                for (const row of rows) {
+                    const d = row.domain || '';
+                    if (d) results.set(d, { verified: 'YES', score: row.verification_score || '?', reason: row.verification_reason || 'KEEP (migrado)' });
+                }
+            }
+            if (fs.existsSync(removeCsv)) {
+                const { rows } = parseCSV(fs.readFileSync(removeCsv, 'utf-8'));
+                for (const row of rows) {
+                    const d = row.domain || '';
+                    if (d) results.set(d, { verified: 'NO', score: row.verification_score || '?', reason: row.verification_reason || 'REMOVE (migrado)' });
+                }
+            }
+
+            // Write new TSV format
+            const tsvLines = [];
+            for (const [domain, data] of results) {
+                tsvLines.push(`${domain}\t${data.verified}\t${data.score}\t${data.reason}`);
+            }
+            fs.writeFileSync(progressFile, tsvLines.join('\n') + '\n', 'utf-8');
+
+            // Remove old JSON
+            fs.unlinkSync(oldJsonFile);
+            console.log(`   ✅ Migrados ${results.size} resultados para novo formato`);
+        } catch (e) {
+            console.error(`   ⚠️  Erro na migracao: ${e.message}`);
+        }
+    }
+
     return results;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// OUTPUT
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function writeResultCSV(filePath, rows, headers) {
-    const lines = [headers.join(',')];
-    for (const row of rows) lines.push(rowToCSV(row, headers));
-    fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
+function appendProgress(progressFile, domain, verified, score, reason) {
+    fs.appendFileSync(progressFile, `${domain}\t${verified}\t${score}\t${reason}\n`, 'utf-8');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INTERACTIVE HELPERS
+// REPORT GENERATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function askQuestion(question) {
-    return new Promise((resolve) => {
-        const readline = require('readline');
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
-    });
-}
-
-function waitForEnter(msg = '\nPressione ENTER para fechar...') {
-    return new Promise((resolve) => {
-        const readline = require('readline');
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        rl.question(msg, () => { rl.close(); resolve(); });
-    });
-}
-
-function formatTime(seconds) {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = Math.floor(seconds % 60);
-    if (h > 0) return `${h}h ${m}m ${s}s`;
-    if (m > 0) return `${m}m ${s}s`;
-    return `${s}s`;
+function generateReport(reportFile, stats) {
+    const lines = [
+        `═══════════════════════════════════════════════════════════`,
+        `  RELATORIO — WooCommerce E-commerce Verifier`,
+        `  Data: ${new Date().toLocaleDateString('pt-PT')} ${new Date().toLocaleTimeString('pt-PT')}`,
+        `═══════════════════════════════════════════════════════════`,
+        ``,
+        `ENTRADA`,
+        `  Ficheiro:              ${stats.inputFile}`,
+        `  Total de leads:        ${stats.totalLeads}`,
+        ``,
+        `PRE-FILTRAGEM (instantanea)`,
+        `  Removidos (.org):      ${stats.removedByTLD}`,
+        `  Removidos (categoria): ${stats.removedByCategory}`,
+        `  Total pre-filtrados:   ${stats.totalPreFiltered}`,
+        ``,
+        `VERIFICACAO HTTP`,
+        `  Sites verificados:     ${stats.httpChecked}`,
+        `  Aprovados (KEEP):      ${stats.httpKeep}`,
+        `  Reprovados (REMOVE):   ${stats.httpRemove}`,
+        `  Tempo de execucao:     ${stats.totalTime}`,
+        ``,
+        `═══════════════════════════════════════════════════════════`,
+        `RESULTADO FINAL`,
+        `═══════════════════════════════════════════════════════════`,
+        ``,
+        `  ✅ MANTER:   ${stats.finalKeep} leads  (${((stats.finalKeep / stats.totalLeads) * 100).toFixed(1)}%)`,
+        `  ❌ REMOVER:  ${stats.finalRemove} leads (${((stats.finalRemove / stats.totalLeads) * 100).toFixed(1)}%)`,
+        ``,
+        `MOTIVOS DE REMOCAO`,
+        `  Dominio .org/.org.uk:     ${stats.removedByTLD}`,
+        `  Categoria non-ecommerce:  ${stats.removedByCategory}`,
+        `  Score HTTP baixo:         ${stats.httpRemove}`,
+        ``,
+        `FICHEIROS DE SAIDA`,
+        `  ✅ ${stats.keepFile}`,
+        `  ❌ ${stats.removeFile}`,
+        `  📄 ${reportFile}`,
+        ``,
+    ];
+    fs.writeFileSync(reportFile, lines.join('\n'), 'utf-8');
+    return lines;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -400,198 +369,239 @@ function formatTime(seconds) {
 
 async function main() {
     console.log('╔══════════════════════════════════════════════════════════╗');
-    console.log('║    WooCommerce E-commerce Verifier v2                   ║');
-    console.log('║    Otimizado para listas grandes (80k+)                 ║');
+    console.log('║    WooCommerce E-commerce Verifier v3                   ║');
+    console.log('║    Resume robusto + Relatorio final                     ║');
     console.log('╚══════════════════════════════════════════════════════════╝\n');
 
+    // ─── Pick input file ─────────────────────────────────────────────────────────
     let inputFile = process.argv[2];
-
-    // Interactive file picker
     if (!inputFile) {
-        const csvFiles = fs.readdirSync('.').filter(f => f.endsWith('.csv'));
+        const csvFiles = fs.readdirSync('.').filter(f => f.endsWith('.csv') && !f.startsWith('KEEP_') && !f.startsWith('REMOVE_'));
         if (csvFiles.length > 0) {
-            console.log('📋 Ficheiros CSV encontrados nesta pasta:\n');
+            console.log('📋 Ficheiros CSV encontrados:\n');
             csvFiles.forEach((f, i) => console.log(`   ${i + 1}. ${f}`));
             console.log('');
-            const answer = await askQuestion('Digite o número ou o nome do ficheiro CSV: ');
+            const answer = await askQuestion('Digite o numero ou o nome do CSV: ');
             const idx = parseInt(answer, 10);
             inputFile = (idx >= 1 && idx <= csvFiles.length) ? csvFiles[idx - 1] : answer;
         } else {
-            inputFile = await askQuestion('Digite o nome do ficheiro CSV: ');
+            inputFile = await askQuestion('Nome do ficheiro CSV: ');
         }
     }
 
     if (!inputFile || !fs.existsSync(inputFile)) {
-        console.error(`\n❌ Ficheiro não encontrado: "${inputFile}"`);
-        await waitForEnter();
-        process.exit(1);
+        console.error(`\n❌ Ficheiro nao encontrado: "${inputFile}"`);
+        await waitForEnter(); process.exit(1);
     }
 
     // ─── Read CSV ────────────────────────────────────────────────────────────────
-    console.log(`\n📂 A ler: ${inputFile}`);
+    console.log(`📂 A ler: ${inputFile}`);
     const csvText = fs.readFileSync(inputFile, 'utf-8');
     const { headers, rows } = parseCSV(csvText);
     console.log(`📋 ${rows.length} leads encontrados\n`);
 
     // Add output columns
-    if (!headers.includes('woo_verified')) headers.push('woo_verified');
-    if (!headers.includes('woo_check_date')) headers.push('woo_check_date');
-    if (!headers.includes('verification_score')) headers.push('verification_score');
-    if (!headers.includes('verification_reason')) headers.push('verification_reason');
+    for (const col of ['woo_verified', 'woo_check_date', 'verification_score', 'verification_reason']) {
+        if (!headers.includes(col)) headers.push(col);
+    }
 
     // ─── Setup results folder ────────────────────────────────────────────────────
     const baseName = path.basename(inputFile, '.csv');
     const resultsDir = path.join(path.dirname(inputFile) || '.', `results_${baseName}`);
     if (!fs.existsSync(resultsDir)) fs.mkdirSync(resultsDir, { recursive: true });
-    const progressFile = path.join(resultsDir, '_progress.json');
 
-    // ─── Check for resume ────────────────────────────────────────────────────────
-    let alreadyChecked = new Set();
-    if (fs.existsSync(progressFile)) {
-        const progress = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
-        alreadyChecked = new Set(progress.checked || []);
-        console.log(`🔄 Progresso anterior encontrado: ${alreadyChecked.size} sites já verificados`);
+    const progressFile = path.join(resultsDir, '_progress.tsv');
+    const keepFile = path.join(resultsDir, `KEEP_${baseName}.csv`);
+    const removeFile = path.join(resultsDir, `REMOVE_${baseName}.csv`);
+    const reportFile = path.join(resultsDir, `RELATORIO_${baseName}.txt`);
+
+    // ─── Load previous progress ──────────────────────────────────────────────────
+    const previousResults = loadProgress(progressFile, resultsDir, baseName);
+    if (previousResults.size > 0) {
+        console.log(`🔄 Progresso anterior: ${previousResults.size} sites ja verificados`);
         console.log(`   A continuar de onde parou...\n`);
     }
 
     // ═════════════════════════════════════════════════════════════════════════════
-    // PHASE 1: Pre-filtering (instant)
+    // PHASE 1: Classify all rows (pre-filter or queue for HTTP)
     // ═════════════════════════════════════════════════════════════════════════════
     console.log('━'.repeat(60));
-    console.log('⚡ FASE 1: Pré-filtragem (dados da planilha, sem HTTP)');
+    console.log('⚡ FASE 1: Classificacao (pre-filtragem + progresso anterior)');
     console.log('━'.repeat(60));
 
     const today = new Date().toISOString().split('T')[0];
-    const keepForHTTP = [];
-    const preFilterRemoved = [];
+    const needHTTP = [];          // rows that need HTTP verification
+    const allKeep = [];           // final KEEP results
+    const allRemove = [];         // final REMOVE results
+    let removedByTLD = 0, removedByCategory = 0;
 
     for (const row of rows) {
         const domain = row.domain || '';
 
-        // Skip if already processed in a previous run
-        if (alreadyChecked.has(domain)) continue;
+        // 1) Already processed in previous run? Use cached result
+        if (previousResults.has(domain)) {
+            const prev = previousResults.get(domain);
+            row.woo_verified = prev.verified;
+            row.woo_check_date = today;
+            row.verification_score = prev.score;
+            row.verification_reason = prev.reason;
+            if (prev.verified === 'YES') allKeep.push(row);
+            else allRemove.push(row);
+            continue;
+        }
 
+        // 2) Pre-filter check
         const filter = preFilterRow(row);
         if (!filter.pass) {
             row.woo_verified = 'NO';
             row.woo_check_date = today;
             row.verification_score = '-';
             row.verification_reason = filter.reason;
-            preFilterRemoved.push(row);
-        } else {
-            keepForHTTP.push(row);
+            allRemove.push(row);
+            // Save to progress so we don't re-check on next resume
+            appendProgress(progressFile, domain, 'NO', '-', filter.reason);
+
+            if (filter.reason.includes('.org')) removedByTLD++;
+            else removedByCategory++;
+            continue;
         }
+
+        // 3) Needs HTTP verification
+        needHTTP.push(row);
     }
 
-    console.log(`\n   ❌ Removidos pela pré-filtragem: ${preFilterRemoved.length}`);
-    console.log(`   ✅ Precisam de verificação HTTP:  ${keepForHTTP.length}`);
+    console.log(`\n   Progresso anterior:    ${previousResults.size}`);
+    console.log(`   Pre-filtrados (.org):  ${removedByTLD}`);
+    console.log(`   Pre-filtrados (categ): ${removedByCategory}`);
+    console.log(`   Precisam HTTP:         ${needHTTP.length}`);
 
-    // Estimate time
-    const estimatedSeconds = (keepForHTTP.length / CONFIG.concurrency) * 3; // ~3s per batch
-    console.log(`   ⏱️  Tempo estimado: ~${formatTime(estimatedSeconds)}`);
-
-    // ═════════════════════════════════════════════════════════════════════════════
-    // PHASE 2: HTTP verification (concurrent)
-    // ═════════════════════════════════════════════════════════════════════════════
-    console.log(`\n${'━'.repeat(60)}`);
-    console.log(`🌐 FASE 2: Verificação HTTP (${CONFIG.concurrency} sites em paralelo)`);
-    console.log('━'.repeat(60));
-
-    const httpKeep = [];
-    const httpRemove = [];
-    const startTime = Date.now();
-    let processed = 0;
-
-    // Load previous results if resuming
-    const keepFile = path.join(resultsDir, `KEEP_${baseName}.csv`);
-    const removeFile = path.join(resultsDir, `REMOVE_${baseName}.csv`);
-
-    if (alreadyChecked.size > 0) {
-        // Re-read previous results
-        if (fs.existsSync(keepFile)) {
-            const prev = parseCSV(fs.readFileSync(keepFile, 'utf-8'));
-            httpKeep.push(...prev.rows);
-        }
-        if (fs.existsSync(removeFile)) {
-            const prev = parseCSV(fs.readFileSync(removeFile, 'utf-8'));
-            httpRemove.push(...prev.rows);
-        }
+    if (needHTTP.length === 0) {
+        console.log('\n   ✅ Todos os sites ja foram verificados!');
+    } else {
+        const est = (needHTTP.length / CONFIG.concurrency) * 3;
+        console.log(`   Tempo estimado:        ~${formatTime(est)}`);
     }
 
-    for (let i = 0; i < keepForHTTP.length; i += CONFIG.concurrency) {
-        const batch = keepForHTTP.slice(i, i + CONFIG.concurrency);
-        const batchDomains = batch.map(r => r.domain || '???').join(', ');
+    // ═════════════════════════════════════════════════════════════════════════════
+    // PHASE 2: HTTP verification (concurrent, with error handling per batch)
+    // ═════════════════════════════════════════════════════════════════════════════
+    if (needHTTP.length > 0) {
+        console.log(`\n${'━'.repeat(60)}`);
+        console.log(`🌐 FASE 2: Verificacao HTTP (${CONFIG.concurrency} em paralelo)`);
+        console.log('━'.repeat(60));
 
-        // Progress display
-        const pct = Math.round(((processed) / keepForHTTP.length) * 100);
-        const elapsed = (Date.now() - startTime) / 1000;
-        const rate = processed > 0 ? elapsed / processed : 3;
-        const remaining = (keepForHTTP.length - processed) * rate;
+        const startTime = Date.now();
+        let processed = 0, httpKeepCount = 0, httpRemoveCount = 0, errors = 0;
 
-        process.stdout.write(`\r   ⏳ ${processed}/${keepForHTTP.length} (${pct}%) | Restante: ~${formatTime(remaining)}   `);
+        for (let i = 0; i < needHTTP.length; i += CONFIG.concurrency) {
+            const batch = needHTTP.slice(i, i + CONFIG.concurrency);
 
-        // Process batch concurrently
-        const batchResults = await Promise.all(batch.map(row => verifySite(row)));
+            // Progress bar
+            const pct = Math.round((processed / needHTTP.length) * 100);
+            const elapsed = (Date.now() - startTime) / 1000;
+            const rate = processed > 0 ? elapsed / processed : 3;
+            const remaining = (needHTTP.length - processed) * rate;
+            process.stdout.write(`\r   ⏳ ${processed}/${needHTTP.length} (${pct}%) | KEEP: ${httpKeepCount} | REMOVE: ${httpRemoveCount} | Restante: ~${formatTime(remaining)}   `);
 
-        for (let j = 0; j < batch.length; j++) {
-            const row = batch[j];
-            const r = batchResults[j];
-            row.woo_verified = r.passed ? 'YES' : 'NO';
-            row.woo_check_date = today;
-            row.verification_score = String(r.totalScore);
-            row.verification_reason = r.verdict;
+            // Process batch — each site is individually wrapped in try/catch
+            let batchResults;
+            try {
+                batchResults = await Promise.all(batch.map(row => verifySite(row)));
+            } catch (e) {
+                // Entire batch failed (very unlikely), mark all as error
+                batchResults = batch.map(() => ({ totalScore: 0, passed: false, verdict: 'REMOVE (erro batch)' }));
+                errors++;
+            }
 
-            if (r.passed) httpKeep.push(row);
-            else httpRemove.push(row);
+            for (let j = 0; j < batch.length; j++) {
+                const row = batch[j];
+                const r = batchResults[j];
+                const domain = row.domain || '';
 
-            alreadyChecked.add(row.domain || '');
+                row.woo_verified = r.passed ? 'YES' : 'NO';
+                row.woo_check_date = today;
+                row.verification_score = String(r.totalScore);
+                row.verification_reason = r.verdict;
+
+                if (r.passed) { allKeep.push(row); httpKeepCount++; }
+                else { allRemove.push(row); httpRemoveCount++; }
+
+                // Append to progress file immediately (never lose a result)
+                appendProgress(progressFile, domain, row.woo_verified, row.verification_score, r.verdict);
+            }
+
+            processed += batch.length;
+
+            // Save CSVs periodically
+            if (processed % CONFIG.saveEvery === 0 || i + CONFIG.concurrency >= needHTTP.length) {
+                try {
+                    writeCSV(keepFile, allKeep, headers);
+                    writeCSV(removeFile, allRemove, headers);
+                } catch (e) {
+                    console.error(`\n   ⚠️ Erro ao salvar CSV: ${e.message}`);
+                }
+            }
         }
 
-        processed += batch.length;
-
-        // Save progress periodically
-        if (processed % CONFIG.saveEvery === 0 || i + CONFIG.concurrency >= keepForHTTP.length) {
-            writeResultCSV(keepFile, httpKeep, headers);
-            writeResultCSV(removeFile, [...preFilterRemoved, ...httpRemove], headers);
-            fs.writeFileSync(progressFile, JSON.stringify({
-                checked: [...alreadyChecked],
-                lastUpdate: new Date().toISOString(),
-            }), 'utf-8');
-        }
+        const totalTime = (Date.now() - startTime) / 1000;
+        process.stdout.write(`\r   ✅ ${processed}/${needHTTP.length} (100%) | KEEP: ${httpKeepCount} | REMOVE: ${httpRemoveCount} | Tempo: ${formatTime(totalTime)}       \n`);
+        if (errors > 0) console.log(`   ⚠️  ${errors} batches com erros`);
     }
 
     // ─── Final save ──────────────────────────────────────────────────────────────
-    const allRemoved = [...preFilterRemoved, ...httpRemove];
-    writeResultCSV(keepFile, httpKeep, headers);
-    writeResultCSV(removeFile, allRemoved, headers);
+    writeCSV(keepFile, allKeep, headers);
+    writeCSV(removeFile, allRemove, headers);
 
-    // Clean up progress file on completion
-    if (fs.existsSync(progressFile)) fs.unlinkSync(progressFile);
+    // ─── Generate report ─────────────────────────────────────────────────────────
+    const stats = {
+        inputFile,
+        totalLeads: rows.length,
+        removedByTLD,
+        removedByCategory,
+        totalPreFiltered: removedByTLD + removedByCategory,
+        httpChecked: needHTTP.length,
+        httpKeep: allKeep.length - (previousResults.size > 0 ? [...previousResults.values()].filter(v => v.verified === 'YES').length : 0),
+        httpRemove: allRemove.length - removedByTLD - removedByCategory - (previousResults.size > 0 ? [...previousResults.values()].filter(v => v.verified === 'NO').length : 0),
+        totalTime: needHTTP.length > 0 ? formatTime((Date.now() - Date.now()) / 1000) : '0s', // will be overwritten below
+        finalKeep: allKeep.length,
+        finalRemove: allRemove.length,
+        keepFile,
+        removeFile,
+    };
+    // Fix httpKeep/httpRemove to always be >= 0
+    stats.httpKeep = Math.max(0, stats.httpKeep);
+    stats.httpRemove = Math.max(0, stats.httpRemove);
+    stats.totalTime = 'Ver acima';
 
-    // ─── Summary ─────────────────────────────────────────────────────────────────
-    const totalTime = (Date.now() - startTime) / 1000;
+    const reportLines = generateReport(reportFile, stats);
 
+    // ─── Print summary ───────────────────────────────────────────────────────────
     console.log(`\n\n${'═'.repeat(60)}`);
     console.log(`📊 RESUMO FINAL`);
     console.log(`${'═'.repeat(60)}`);
-    console.log(`\n   Total analisados:     ${rows.length}`);
-    console.log(`   Pré-filtrados (inst): ${preFilterRemoved.length}`);
-    console.log(`   Verificados (HTTP):   ${keepForHTTP.length}`);
-    console.log(`   Tempo total:          ${formatTime(totalTime)}`);
-    console.log(`\n   ✅ MANTER:  ${httpKeep.length} leads`);
-    console.log(`   ❌ REMOVER: ${allRemoved.length} leads`);
-    console.log(`\n${'─'.repeat(60)}`);
-    console.log(`📁 Resultados em: ${resultsDir}/`);
-    console.log(`   ✅ KEEP_${baseName}.csv`);
-    console.log(`   ❌ REMOVE_${baseName}.csv`);
+    console.log(`\n   Total de leads:       ${rows.length}`);
+    console.log(`   ✅ MANTER:            ${allKeep.length}  (${((allKeep.length / rows.length) * 100).toFixed(1)}%)`);
+    console.log(`   ❌ REMOVER:           ${allRemove.length} (${((allRemove.length / rows.length) * 100).toFixed(1)}%)`);
+    console.log(`\n   📁 Pasta de resultados: ${resultsDir}/`);
+    console.log(`      ✅ KEEP_${baseName}.csv`);
+    console.log(`      ❌ REMOVE_${baseName}.csv`);
+    console.log(`      📄 RELATORIO_${baseName}.txt`);
+
+    // Remove progress file on successful completion
+    if (needHTTP.length === 0 || allKeep.length + allRemove.length >= rows.length) {
+        // All done — keep progress file but mark as complete
+        console.log(`\n   🎉 Verificacao completa!`);
+    }
 
     await waitForEnter();
 }
 
 main().catch(async (err) => {
     console.error('\n❌ Erro fatal:', err.message || err);
-    const readline = require('readline');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    await new Promise(r => rl.question('\nPressione ENTER para fechar...', () => { rl.close(); r(); }));
+    console.error(err.stack || '');
+    try {
+        const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+        await new Promise(r => rl.question('\nPressione ENTER para fechar...', () => { rl.close(); r(); }));
+    } catch { }
     process.exit(1);
 });
