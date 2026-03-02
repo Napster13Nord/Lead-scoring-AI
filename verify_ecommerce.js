@@ -595,8 +595,29 @@ async function main() {
 
 }
 
+// Write crash info to file so user can share it even if terminal closes
+function writeCrashLog(err) {
+    try {
+        const msg = `[${new Date().toISOString()}] CRASH:\n${err.stack || err.message || err}\n\n`;
+        fs.appendFileSync('_debug_log.txt', msg, 'utf-8');
+    } catch { }
+}
+
+process.on('uncaughtException', (err) => {
+    console.error('\n❌ Erro fatal (uncaught):', err.message || err);
+    writeCrashLog(err);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('\n❌ Erro fatal (unhandled):', err.message || err);
+    writeCrashLog(err);
+    process.exit(1);
+});
+
 main().catch((err) => {
     console.error('\n❌ Erro fatal:', err.message || err);
     console.error(err.stack || '');
+    writeCrashLog(err);
     process.exit(1);
 });

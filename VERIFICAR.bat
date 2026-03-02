@@ -3,19 +3,11 @@ chcp 65001 >nul 2>&1
 title WooCommerce E-commerce Verifier
 cd /d "%~dp0"
 
-REM ======================================================
-REM  COMO USAR:
-REM  - Duplo clique neste ficheiro para abrir
-REM  - Ou arraste um CSV para cima deste ficheiro
-REM ======================================================
-
 REM Check if Node.js is installed
 where node >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    echo.
     echo  ERROR: Node.js nao encontrado!
     echo  Instale em: https://nodejs.org
-    echo.
     pause
     exit /b 1
 )
@@ -27,13 +19,5 @@ if "%~1"=="" (
     node verify_ecommerce.js "%~1"
 )
 
-REM If node crashed, keep the window open so user can see the error
-if %ERRORLEVEL% neq 0 (
-    echo.
-    echo ============================================
-    echo  ERRO: O script terminou com erro.
-    echo  Codigo de erro: %ERRORLEVEL%
-    echo ============================================
-    echo.
-)
+echo.
 pause
