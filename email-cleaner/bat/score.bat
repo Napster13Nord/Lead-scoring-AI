@@ -4,7 +4,8 @@ title Lead Scorer
 
 echo.
 echo ============================================
-echo      LEAD SCORER - Score 0-100 por Lead
+echo       LEAD SCORER - Passo 3
+echo    Pontua leads de 0-100 por potencial
 echo ============================================
 echo.
 
@@ -12,8 +13,7 @@ if "%~1"=="" (
     echo [ERRO] Nenhum arquivo foi fornecido!
     echo.
     echo Como usar:
-    echo   1. Arraste um arquivo .csv para cima deste .bat
-    echo   2. OU execute: score.bat "caminho\para\arquivo.csv"
+    echo   Arraste um arquivo .csv para cima deste .bat
     echo.
     pause
     exit /b 1
@@ -29,10 +29,10 @@ if errorlevel 1 (
 )
 
 set "SCRIPT_DIR=%~dp0"
-echo Arquivo selecionado: %~nx1
+echo Arquivo: %~nx1
 echo.
 
-node "%SCRIPT_DIR%lead_scorer.js" "%~1"
+node "%SCRIPT_DIR%..\scripts\lead_scorer.js" "%~1"
 
 echo.
 echo ============================================
