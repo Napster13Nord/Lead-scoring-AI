@@ -224,8 +224,11 @@ function main() {
 
     // ── Write output ──────────────────────────────────
     const inputDir = path.dirname(file1Path);
-    const inputBase = path.basename(file1Path, path.extname(file1Path));
-    const outputDir = path.join(inputDir, '..', 'output', 'output_linkedin_merge');
+    const inputBase = path.basename(file1Path, path.extname(file1Path))
+        .replace(/linkedin scrape,?\s*/i, '')
+        .replace(/[-\s]+need to merge.*/i, '')
+        .trim().replace(/\s+/g, '_') || 'batch';
+    const outputDir = path.join(inputDir, '..', 'output', `output_linkedin_merge_${inputBase}`);
     if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
     const allPath = path.join(outputDir, 'merged_all.xlsx');
