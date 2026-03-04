@@ -152,32 +152,12 @@ function main() {
         else if (source === 'li_email_related_domain') stats.liRelated++;
         else stats.fallback++;
 
-        // Build Instantly row
-        const firstName = String(r.li_first_name || '').trim();
-        const lastName = String(r.li_last_name || '').trim();
-
+        // Keep ALL original columns + append fixed email columns at the end
         output.push({
-            // ── Required by Instantly ──
-            email,
-            first_name: firstName || '',
-            last_name: lastName || '',
-
-            // ── Personalisation variables ──
-            company: String(r.li_company_name || r.domain || '').trim(),
-            website: String(r.domain_url || ('https://' + r.domain) || '').trim(),
-            job_title: String(r.li_job_title || '').trim(),
-            city: String(r.li_city || '').trim(),
-            country: String(r.li_country || '').trim(),
-            linkedin_personal: String(r.li_linkedin || '').trim(),
-            monthly_sales: String(r.estimated_monthly_sales || '').trim(),
-            lead_grade: String(r.lead_grade || '').trim(),
-            lead_score: String(r.lead_score || '').trim(),
-
-            // ── Meta (for your reference) ──
-            store_domain: String(r.domain || '').trim(),
-            best_email_orig: String(r.best_email || '').trim(),
-            email_source: source,
-            is_personal_email: isPersonal ? 'yes' : 'no',
+            ...r,                                         // every original column
+            email_final: email,                     // the fixed/chosen email
+            email_source: source,                    // how it was picked
+            is_personal_email: isPersonal ? 'yes' : 'no',// gmail/icloud etc?
         });
 
         if (i % 100 === 0 || i === rows.length - 1) {
@@ -219,10 +199,8 @@ function main() {
         '',
         '── ARQUIVO GERADO ─────────────────────────────────────────',
         `  ${path.basename(outCSV)}`,
-        '  Colunas: email, first_name, last_name, company, website,',
-        '           job_title, city, country, linkedin_personal,',
-        '           monthly_sales, lead_grade, lead_score,',
-        '           email_source, is_personal_email',
+        '  Colunas: TODAS as originais + email_final, email_source, is_personal_email',
+        '  Use a coluna "email_final" como o email para a campanha no Instantly',
         '══════════════════════════════════════════════════════════',
     ].join('\n');
 
